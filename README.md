@@ -26,6 +26,8 @@ Built on a strict Z-Up coordinate architecture (`X` = Red Width, `Y` = Green Dep
 * **Targeted Camera Panning & Wayland-Safe Orbit Navigation:** Orbits (`MMB Drag`), pans (`Shift + MMB Drag`), and smoothly zooms (`Mouse Scroll`) around a dynamic 3D `FocalPoint` resource using raw `MouseMotion` deltas—explicitly avoiding `CursorGrabMode::Locked` to prevent Wayland/Hyprland cursor warping glitches.
 * **Perfected Parallel Neighbor & Top-Face Inference Engine:** Scans edges of adjacent `CadObject` entities within a 40m proximity radius. When the active drawing or translation vector aligns within `2.0°` of a neighbor edge (or snaps flush with an existing block's top face), DraftDown locks onto the vector and renders an infinite dashed **Magenta** alignment guide line across the viewport.
 * **Collapsible Hotkeys Cheat Sheet & Clean Wayland Exit (`[Ctrl + Q]`):** Built-in shortcut reference panel in the left toolbar and a prominent **Exit Application** button that dispatches `bevy::app::AppExit::Success`.
+* **Camera-Oriented Dynamic Drawing Plane & Strict Integer Snapping:** Automatically projects cursor rays onto the dominant primary axis plane (`XY`, `XZ`, or `YZ`) or a camera-facing plane at steep horizon angles, snapping 3D coordinates strictly to `1.0m` integer grid increments (or exact typed VCB dimensions) to eliminate warped geometry.
+* **Raycast-Targeted Camera Orbit & Damped Smoothing:** Clicking `MMB` casts a ray into the 3D scene to lock the orbit `FocalPoint` directly onto the clicked `CadObject` (or ground fallback) without camera jumps, paired with exponential mouse delta smoothing and a strict `-85°` to `+85°` pitch lock.
 
 ## Project Architecture
 

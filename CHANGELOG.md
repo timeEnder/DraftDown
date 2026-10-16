@@ -25,3 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 * [Changed] - Officially rebranded the project from `sketchcraft` to **DraftDown** for open-source repository uniqueness.
+
+## [0.1.1] — Camera-Oriented Raycasting & Damped Targeted Orbit
+
+### Added
+
+* [Added] - Camera-oriented `DynamicDrawingPlane` selector (`HorizontalXY`, `VerticalXZ`, `VerticalYZ`, and `CameraFacing` fallback) that automatically chooses the dominant primary axis plane based on the camera's forward vector.
+* [Added] - SketchUp-style raycast-targeted camera orbit (`OrbitCamera::reanchor_to_pivot`) that casts a ray on Middle-Mouse Button (MMB) press to re-anchor `FocalPoint` directly onto the clicked `CadObject` mesh (or ground plane fallback) without camera eye teleportation.
+* [Added] - Exponential mouse motion smoothing and spherical coordinate damping (`damping_sharpness`) in `orbit_camera_controller` to eliminate Wayland/Hyprland input stutter.
+
+### Fixed
+
+* [Fixed] - Warped and skewed 3D object placement at shallow/horizon camera angles by replacing rigid `Z=0` plane projection with dynamic axis-plane intersection and strict `1.0m` integer grid increment snapping (`snap_vec3_to_integer_grid`).
+* [Fixed] - Camera upside-down inversion and polar gimbal lock by clamping vertical pitch strictly between `-85°` and `+85°` (`MAX_CAMERA_PITCH_RAD`) and keeping target azimuth continuous across `2π` boundaries.
