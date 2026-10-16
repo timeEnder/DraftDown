@@ -28,6 +28,7 @@ Built on a strict Z-Up coordinate architecture (`X` = Red Width, `Y` = Green Dep
 * **Collapsible Hotkeys Cheat Sheet & Clean Wayland Exit (`[Ctrl + Q]`):** Built-in shortcut reference panel in the left toolbar and a prominent **Exit Application** button that dispatches `bevy::app::AppExit::Success`.
 * **Camera-Oriented Dynamic Drawing Plane & Strict Integer Snapping:** Automatically projects cursor rays onto the dominant primary axis plane (`XY`, `XZ`, or `YZ`) or a camera-facing plane at steep horizon angles, snapping 3D coordinates strictly to `1.0m` integer grid increments (or exact typed VCB dimensions) to eliminate warped geometry.
 * **Raycast-Targeted Camera Orbit & Damped Smoothing:** Clicking `MMB` casts a ray into the 3D scene to lock the orbit `FocalPoint` directly onto the clicked `CadObject` (or ground fallback) without camera jumps, paired with exponential mouse delta smoothing and a strict `-85°` to `+85°` pitch lock.
+* **Offset Tool (`[F]`):** Hover over any existing 3D block face or connected coplanar edge chain to highlight its perimeter, then drag inward/outward or type an exact decimal offset distance (e.g., `0.3` for 30cm wall thickness) into the VCB and press `Enter` to generate a concentric mitered edge loop via `CreateOffsetCommand`.
 
 ## Project Architecture
 
@@ -98,6 +99,7 @@ WINIT_UNIX_BACKEND=wayland cargo run
 | `Ctrl + Y` / `Ctrl + Shift + Z` | Redo Command |
 | `Escape` | Cancel Active Operation / Break Line Chain |
 | `Ctrl + Q` | Exit Application Cleanly |
+| F | Offset
 
 ## License
 

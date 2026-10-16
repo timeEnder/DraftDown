@@ -1,4 +1,4 @@
-use std::f32::consts::{FRAC_PI_2, TAU};
+use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use bevy::{
     app::AppExit,
@@ -18,16 +18,12 @@ use bevy::{
 
 use crate::{
     commands::{
-        CadGeometryKind, CadObject, Command, CommandHistory, CreateBlockCommand, DeleteCommand,
-        DrawLineCommand, GroupId, HistoryAction, MoveObjectCommand, PendingHistoryActions,
-        ScaleObjectCommand,
+        CadGeometryKind, CadObject, Command, CommandHistory, CreateBlockCommand,
+        CreateOffsetCommand, DeleteCommand, DrawLineCommand, GroupId, HistoryAction,
+        MoveObjectCommand, PendingHistoryActions, ScaleObjectCommand,
     },
     ui::UiInputCapture,
 };
-
-// ============================================================================
-// SKETCHUP & INFERENCE COLOR CONSTANTS
-// ============================================================================
 
 pub const AXIS_RED_COLOR: Color = Color::srgb(0.92, 0.16, 0.16);
 pub const AXIS_GREEN_COLOR: Color = Color::srgb(0.18, 0.80, 0.24);
@@ -38,11 +34,14 @@ pub const NEON_BLUE_SELECTION_COLOR: Color = Color::srgb(0.05, 0.88, 1.0);
 pub const SCALE_BBOX_COLOR: Color = Color::srgb(1.0, 0.78, 0.15);
 pub const SCALE_HANDLE_COLOR: Color = Color::srgb(0.15, 0.95, 0.55);
 pub const SCALE_ACTIVE_HANDLE_COLOR: Color = Color::srgb(1.0, 0.30, 0.20);
+pub const OFFSET_HIGHLIGHT_COLOR: Color = Color::srgb(0.20, 0.95, 0.88);
+pub const OFFSET_PREVIEW_COLOR: Color = Color::srgb(1.0, 0.58, 0.16);
 
-/// Maximum proximity radius (in meters) when scanning neighbor `CadObject` edges for parallel inference.
-const NEIGHBOR_PROXIMITY_RADIUS: f32 = 40.0;
-/// Maximum angular deviation in degrees (2.0°) for snapping parallel to a neighbor's edge.
-const PARALLEL_SNAP_MAX_ANGLE_DEG: f32 = 2.0;
+const GRID_SNAP_STEP: f32 = 1.0_f32;
+const NEIGHBOR_SCAN_RADIUS: f32 = 40.0_f32;
+const PARALLEL_THRESHOLD_DEG: f32 = 2.0_f32;
+const PITCH_LIMIT_RAD: f32 = 85.0_f32 * (PI / 180.0_f32);
+const MAX_PLANE_RAY_DIST: f32 = 85.0_f32;
 
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CadToolsSet;
@@ -56,39 +55,36 @@ impl Plugin for CadToolsPlugin {
             .init_resource::<ToolDraftState>()
             .init_resource::<MoveToolState>()
             .init_resource::<ScaleToolState>()
+            .init_resource::<OffsetToolState>()
             .init_resource::<VcbInput>()
             .init_resource::<SelectedCadObjects>()
             .init_resource::<FocalPoint>()
             .add_systems(
                 Startup,
                 (
-                    setup_cad_environment_and_lighting,
-                    setup_orbit_camera,
-                    setup_block_preview_entity,
-                    seed_initial_cad_scene,
+                    init_cad_scene_and_lights,
+                    init_orbit_camera,
+                    init_block_preview_mesh,
+                    populate_starter_geometry,
                 )
                     .chain(),
             )
             .add_systems(
                 Update,
                 (
-                    capture_keyboard_vcb_and_shortcuts,
-                    update_mouse_raycasting_and_inference,
-                    orbit_camera_controller,
-                    handle_viewport_tool_interactions,
-                    sync_selection_highlighting,
-                    update_transparent_block_preview,
-                    render_infinite_grid_and_tool_gizmos,
+                    process_keyboard_and_vcb_events,
+                    compute_raycast_and_snapping,
+                    update_orbit_camera_motion,
+                    process_viewport_pointer_actions,
+                    refresh_selection_materials,
+                    sync_block_preview_mesh,
+                    draw_viewport_gizmos,
                 )
                     .chain()
                     .in_set(CadToolsSet),
             );
     }
 }
-
-// ============================================================================
-// TOOL STATE MACHINE & INFERENCE RESOURCES
-// ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CadTool {
@@ -98,6 +94,7 @@ pub enum CadTool {
     Block,
     Move,
     Scale,
+    Offset,
     PushPullExtrude,
 }
 
@@ -109,6 +106,7 @@ impl CadTool {
             Self::Block => "Block (B)",
             Self::Move => "Move (M)",
             Self::Scale => "Scale (S)",
+            Self::Offset => "Offset (F)",
             Self::PushPullExtrude => "Push/Pull",
         }
     }
@@ -120,30 +118,22 @@ impl CadTool {
             Self::Block => "Dimensions (W,D,H)",
             Self::Move => "Move Distance",
             Self::Scale => "Scale Factor",
+            Self::Offset => "Offset Distance",
             Self::PushPullExtrude => "Extrude Height",
         }
     }
 
     pub const fn status_hint(self) -> &'static str {
         match self {
-            Self::Select => {
-                "LMB: Select Object (Neon Blue) | Del/Backspace: Delete | M: Move | S: Scale"
+            Self::Select => "LMB: Select Object | MMB on Object: Targeted Orbit | Del: Delete",
+            Self::LineDraw => "Click to chain lines | Hold Shift: Vertical Z | Magenta: 2° Parallel Guide",
+            Self::Block => "1st Click: Corner | 2nd Click: Commit Block | Or type 'W,D,H' + Enter",
+            Self::Move => "LMB Drag on object: Translate | Hold Shift: Vertical Z | Release: Commit",
+            Self::Scale => "LMB Drag any of the 8 corner handles | Or type Scale Factor + Enter",
+            Self::Offset => {
+                "Hover face/chain -> LMB Drag inward/outward or type decimal offset (e.g. 0.3) + Enter"
             }
-            Self::LineDraw => {
-                "Click to chain lines | Hold Shift: Vertical Blue (Z) | Magenta: 2° Parallel Guide | Esc: Break"
-            }
-            Self::Block => {
-                "1st Click: Corner | 2nd Click: Commit Block | Or type 'W,D,H' (e.g. 3,4,2) + Enter"
-            }
-            Self::Move => {
-                "LMB Drag on object: Translate with R/G/B & Magenta snapping | Hold Shift: Vertical Z | Release: Commit"
-            }
-            Self::Scale => {
-                "LMB Drag any of the 8 bounding-box corner handles to resize | Or type Scale Factor (e.g. 1.5) + Enter"
-            }
-            Self::PushPullExtrude => {
-                "Click to extrude 3D column | Type height + Enter | Space: Select Tool"
-            }
+            Self::PushPullExtrude => "Click to extrude 3D column | Type height + Enter",
         }
     }
 }
@@ -153,18 +143,51 @@ pub struct ActiveToolState {
     pub current: CadTool,
 }
 
-/// Dynamic focal target vector around which the camera orbits and zooms,
-/// shifted in 3D space via `Shift + Middle-Mouse Button` dragging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DynamicDrawingPlane {
+    #[default]
+    HorizontalXY,
+    VerticalXZ,
+    VerticalYZ,
+    CameraFacing,
+}
+
+impl DynamicDrawingPlane {
+    pub fn choose_for_view(forward: Vec3, has_anchor: bool) -> Self {
+        let ax = forward.x.abs();
+        let ay = forward.y.abs();
+        let az = forward.z.abs();
+
+        if az >= 0.32 && (!has_anchor || az >= ax.max(ay) * 0.55) {
+            Self::HorizontalXY
+        } else if ax >= ay && ax >= az {
+            Self::VerticalYZ
+        } else if ay >= ax && ay >= az {
+            Self::VerticalXZ
+        } else {
+            Self::HorizontalXY
+        }
+    }
+
+    pub fn normal_dir(self, cam_forward: Dir3) -> Dir3 {
+        match self {
+            Self::HorizontalXY => Dir3::Z,
+            Self::VerticalXZ => Dir3::Y,
+            Self::VerticalYZ => Dir3::X,
+            Self::CameraFacing => -cam_forward,
+        }
+    }
+}
+
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct FocalPoint(pub Vec3);
 
 impl Default for FocalPoint {
     fn default() -> Self {
-        Self(Vec3::new(1.5, 1.5, 0.5))
+        Self(Vec3::new(1.0, 1.0, 0.0))
     }
 }
 
-/// Tracks primary axis snapping (Red/Green/Blue) and advanced neighbor inference (Magenta).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum AxisInference {
     #[default]
@@ -196,7 +219,7 @@ impl AxisInference {
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::None => "Free",
+            Self::None => "Grid Snap (1m)",
             Self::RedX => "On Red Axis (X)",
             Self::GreenY => "On Green Axis (Y)",
             Self::BlueZ => "On Blue Axis (Z / Vertical)",
@@ -213,6 +236,7 @@ pub struct CursorRayState {
     pub is_valid_hit: bool,
     pub inference: AxisInference,
     pub vertical_z_locked: bool,
+    pub active_plane: DynamicDrawingPlane,
 }
 
 #[derive(Resource, Debug)]
@@ -232,7 +256,6 @@ impl Default for ToolDraftState {
     }
 }
 
-/// Active drag state for the Move Tool (`CadTool::Move`).
 #[derive(Debug, Clone)]
 pub struct ActiveMoveDrag {
     pub entity: Entity,
@@ -247,7 +270,6 @@ pub struct MoveToolState {
     pub active_drag: Option<ActiveMoveDrag>,
 }
 
-/// Active handle drag state for the Scale Tool (`CadTool::Scale`).
 #[derive(Debug, Clone)]
 pub struct ActiveScaleDrag {
     pub entity: Entity,
@@ -265,14 +287,120 @@ pub struct ScaleToolState {
     pub hovered_handle: Option<usize>,
 }
 
-/// SketchUp-style Value Control Box (VCB / Measurements) buffer.
+/// Represents a detected 2D contour (either a closed Block face perimeter or a connected chain of lines)
+/// that can be offset inwards or outwards.
+#[derive(Debug, Clone)]
+pub struct OffsetContour {
+    pub segments: Vec<(Vec3, Vec3)>,
+    pub center: Vec3,
+    pub plane_z: f32,
+    pub group_id: Option<GroupId>,
+}
+
+impl OffsetContour {
+    /// Generates a concentric replica of `self.segments` offset by `signed_distance`
+    /// (`> 0.0` = outward away from `self.center`, `< 0.0` = inward toward `self.center`).
+    pub fn compute_offset_segments(&self, signed_distance: f32) -> Vec<(Vec3, Vec3)> {
+        if self.segments.is_empty() || signed_distance.abs() <= 0.001 {
+            return Vec::new();
+        }
+
+        // Compute outward-pointing 2D normal for each segment on the X/Y plane
+        let shifted_lines: Vec<(Vec3, Vec3, Vec2)> = self
+            .segments
+            .iter()
+            .filter_map(|&(a, b)| {
+                let d2 = Vec2::new(b.x - a.x, b.y - a.y);
+                let len = d2.length();
+                if len <= 0.001 {
+                    return None;
+                }
+                let tangent = d2 / len;
+                let mut normal = Vec2::new(-tangent.y, tangent.x);
+                let mid = (a + b) * 0.5;
+                let from_center = Vec2::new(mid.x - self.center.x, mid.y - self.center.y);
+                if normal.dot(from_center) < 0.0 {
+                    normal = -normal;
+                }
+                let shift = Vec3::new(
+                    normal.x * signed_distance,
+                    normal.y * signed_distance,
+                    0.0,
+                );
+                Some((a + shift, b + shift, tangent))
+            })
+            .collect();
+
+        let count = shifted_lines.len();
+        if count == 0 {
+            return Vec::new();
+        }
+        if count == 1 {
+            return vec![(shifted_lines[0].0, shifted_lines[0].1)];
+        }
+
+        // Check if the original contour forms a closed loop
+        let first_pt = self.segments.first().map(|s| s.0).unwrap_or(Vec3::ZERO);
+        let last_pt = self.segments.last().map(|s| s.1).unwrap_or(Vec3::ZERO);
+        let is_closed = first_pt.distance(last_pt) <= 0.08;
+
+        // Intersect adjacent shifted lines in 2D to form clean miter corners
+        let mut out_segments = Vec::with_capacity(count);
+        for i in 0..count {
+            let (curr_a, curr_b, curr_t) = shifted_lines[i];
+
+            let start_vertex = if i == 0 && !is_closed {
+                curr_a
+            } else {
+                let prev_idx = if i == 0 { count - 1 } else { i - 1 };
+                let (prev_a, prev_b, prev_t) = shifted_lines[prev_idx];
+                intersect_2d_lines(prev_a, prev_b, prev_t, curr_a, curr_t)
+            };
+
+            let end_vertex = if i + 1 == count && !is_closed {
+                curr_b
+            } else {
+                let next_idx = (i + 1) % count;
+                let (next_a, _, next_t) = shifted_lines[next_idx];
+                intersect_2d_lines(curr_a, curr_b, curr_t, next_a, next_t)
+            };
+
+            if start_vertex.distance(end_vertex) > 0.02 {
+                out_segments.push((start_vertex, end_vertex));
+            }
+        }
+
+        out_segments
+    }
+}
+
+fn intersect_2d_lines(p1: Vec3, p1_end: Vec3, d1: Vec2, p2: Vec3, d2: Vec2) -> Vec3 {
+    let cross = d1.x * d2.y - d1.y * d2.x;
+    if cross.abs() < 1e-4 {
+        return p1_end;
+    }
+    let delta = Vec2::new(p2.x - p1.x, p2.y - p1.y);
+    let t = (delta.x * d2.y - delta.y * d2.x) / cross;
+    // Clamp extreme miter spikes
+    let clamped_t = t.clamp(-25.0, 25.0);
+    Vec3::new(p1.x + d1.x * clamped_t, p1.y + d1.y * clamped_t, p1.z)
+}
+
+#[derive(Resource, Debug, Default)]
+pub struct OffsetToolState {
+    pub hovered_contour: Option<OffsetContour>,
+    pub active_contour: Option<OffsetContour>,
+    pub is_dragging: bool,
+    pub grab_radius: f32,
+    pub current_offset_distance: f32,
+}
+
 #[derive(Resource, Debug, Default)]
 pub struct VcbInput {
     pub buffer: String,
     pub last_status_message: Option<String>,
 }
 
-/// Tracks currently selected `CadObject` entities for neon-blue highlighting, Move, Scale, and Delete.
 #[derive(Resource, Debug, Default)]
 pub struct SelectedCadObjects {
     pub entities: Vec<Entity>,
@@ -281,18 +409,20 @@ pub struct SelectedCadObjects {
 #[derive(Component, Debug)]
 pub struct BlockPreviewVisual;
 
-// ============================================================================
-// HYPRLAND-COMPATIBLE ORBIT CAMERA AROUND DYNAMIC `FocalPoint`
-// ============================================================================
-
 #[derive(Component, Debug)]
 pub struct OrbitCamera {
     pub radius: f32,
+    pub target_radius: f32,
     pub azimuth: f32,
+    pub target_azimuth: f32,
     pub elevation: f32,
+    pub target_elevation: f32,
+    pub target_focus: Vec3,
+    pub smoothed_delta: Vec2,
     pub orbit_sensitivity: f32,
     pub pan_sensitivity: f32,
     pub zoom_sensitivity: f32,
+    pub damping: f32,
     pub min_radius: f32,
     pub max_radius: f32,
     pub is_mmb_dragging: bool,
@@ -300,13 +430,20 @@ pub struct OrbitCamera {
 
 impl Default for OrbitCamera {
     fn default() -> Self {
+        let focus = Vec3::new(1.0, 1.0, 0.0);
         Self {
             radius: 16.0,
+            target_radius: 16.0,
             azimuth: -1.15,
+            target_azimuth: -1.15,
             elevation: 0.52,
-            orbit_sensitivity: 0.0055,
-            pan_sensitivity: 0.0018,
+            target_elevation: 0.52,
+            target_focus: focus,
+            smoothed_delta: Vec2::ZERO,
+            orbit_sensitivity: 0.0052,
+            pan_sensitivity: 0.0017,
             zoom_sensitivity: 0.12,
+            damping: 18.0,
             min_radius: 0.75,
             max_radius: 300.0,
             is_mmb_dragging: false,
@@ -315,28 +452,44 @@ impl Default for OrbitCamera {
 }
 
 impl OrbitCamera {
-    pub fn compute_transform(&self, focal_point: Vec3) -> Transform {
-        let clamped_el = self.elevation.clamp(-FRAC_PI_2 + 0.04, FRAC_PI_2 - 0.04);
-        let clamped_radius = self.radius.clamp(self.min_radius, self.max_radius);
+    pub fn build_transform(&self, focus: Vec3) -> Transform {
+        let el = self.elevation.clamp(-PITCH_LIMIT_RAD, PITCH_LIMIT_RAD);
+        let r = self.radius.clamp(self.min_radius, self.max_radius);
+        let h = r * el.cos();
+        let eye = focus + Vec3::new(h * self.azimuth.cos(), h * self.azimuth.sin(), r * el.sin());
+        Transform::from_translation(eye).looking_at(focus, Vec3::Z)
+    }
 
-        let horiz = clamped_radius * clamped_el.cos();
-        let offset = Vec3::new(
-            horiz * self.azimuth.cos(),
-            horiz * self.azimuth.sin(),
-            clamped_radius * clamped_el.sin(),
-        );
-        let eye = focal_point + offset;
-        Transform::from_translation(eye).looking_at(focal_point, Vec3::Z)
+    pub fn reanchor_pivot(&mut self, eye: Vec3, pivot: Vec3) {
+        let vec = eye - pivot;
+        let dist = vec.length().clamp(self.min_radius, self.max_radius);
+        if dist <= 0.001 {
+            return;
+        }
+        let el = (vec.z / dist)
+            .clamp(-1.0, 1.0)
+            .asin()
+            .clamp(-PITCH_LIMIT_RAD, PITCH_LIMIT_RAD);
+        let az = vec.y.atan2(vec.x);
+
+        self.target_focus = pivot;
+        self.radius = dist;
+        self.target_radius = dist;
+        self.azimuth = az;
+        self.target_azimuth = az;
+        self.elevation = el;
+        self.target_elevation = el;
     }
 }
 
-fn setup_orbit_camera(mut commands: Commands, focal_point: Res<FocalPoint>) {
-    let orbit = OrbitCamera::default();
-    let initial_transform = orbit.compute_transform(focal_point.0);
+fn init_orbit_camera(mut commands: Commands, focal_point: Res<FocalPoint>) {
+    let mut cam = OrbitCamera::default();
+    cam.target_focus = focal_point.0;
+    let tr = cam.build_transform(focal_point.0);
 
     commands.spawn((
         Camera3dBundle {
-            transform: initial_transform,
+            transform: tr,
             projection: Projection::Perspective(PerspectiveProjection {
                 fov: 45.0_f32.to_radians(),
                 near: 0.05,
@@ -345,84 +498,141 @@ fn setup_orbit_camera(mut commands: Commands, focal_point: Res<FocalPoint>) {
             }),
             ..default()
         },
-        orbit,
+        cam,
     ));
 }
 
-fn orbit_camera_controller(
+#[allow(clippy::too_many_arguments)]
+fn update_orbit_camera_motion(
+    time: Res<Time>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     keyboard: Res<ButtonInput<KeyCode>>,
     ui_capture: Res<UiInputCapture>,
+    window_query: Query<&Window, With<PrimaryWindow>>,
+    cad_objects: Query<(Entity, &CadObject)>,
     mut focal_point: ResMut<FocalPoint>,
     mut motion_events: EventReader<MouseMotion>,
     mut scroll_events: EventReader<MouseWheel>,
-    mut camera_query: Query<(&mut OrbitCamera, &mut Transform)>,
+    mut camera_query: Query<(&Camera, &GlobalTransform, &mut OrbitCamera, &mut Transform)>,
 ) {
-    let mut delta = Vec2::ZERO;
+    let mut raw_delta = Vec2::ZERO;
     for ev in motion_events.read() {
-        delta += ev.delta;
+        raw_delta += ev.delta;
     }
 
-    let mut scroll = 0.0_f32;
+    let mut wheel = 0.0_f32;
     for ev in scroll_events.read() {
-        let scale = match ev.unit {
+        let mult = match ev.unit {
             MouseScrollUnit::Line => 1.0,
             MouseScrollUnit::Pixel => 0.025,
         };
-        scroll += ev.y * scale;
+        wheel += ev.y * mult;
     }
 
-    let Ok((mut orbit, mut transform)) = camera_query.get_single_mut() else {
+    let Ok((camera, cam_global, mut orbit, mut transform)) = camera_query.get_single_mut() else {
         return;
     };
 
-    if mouse_buttons.just_pressed(MouseButton::Middle) && !ui_capture.egui_wants_pointer {
-        orbit.is_mmb_dragging = true;
-    }
-    if !mouse_buttons.pressed(MouseButton::Middle) {
-        orbit.is_mmb_dragging = false;
-    }
-
     let shift_held = keyboard.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
 
-    if orbit.is_mmb_dragging && delta.length_squared() > 0.0 {
-        if shift_held {
-            let local_right = transform.rotation * Vec3::X;
-            let local_up = transform.rotation * Vec3::Y;
-            let pan_scale = orbit.radius.max(1.0) * orbit.pan_sensitivity;
-            let pan_offset =
-                (-delta.x * pan_scale * local_right) + (delta.y * pan_scale * local_up);
-            focal_point.0 += pan_offset;
-        } else {
-            orbit.azimuth = (orbit.azimuth - delta.x * orbit.orbit_sensitivity) % TAU;
-            orbit.elevation = (orbit.elevation + delta.y * orbit.orbit_sensitivity)
-                .clamp(-FRAC_PI_2 + 0.04, FRAC_PI_2 - 0.04);
+    if mouse_buttons.just_pressed(MouseButton::Middle) && !ui_capture.egui_wants_pointer {
+        orbit.is_mmb_dragging = true;
+        orbit.smoothed_delta = Vec2::ZERO;
+
+        if !shift_held {
+            if let Ok(window) = window_query.get_single() {
+                let screen_pt = window
+                    .cursor_position()
+                    .unwrap_or_else(|| Vec2::new(window.width() * 0.5, window.height() * 0.5));
+
+                if let Some(ray) = camera.viewport_to_world(cam_global, screen_pt) {
+                    let mut best_hit: Option<f32> = None;
+                    for (_, obj) in cad_objects.iter() {
+                        if let Some(d) = ray_intersects_cad_object(&ray, obj) {
+                            if best_hit.map(|b| d < b).unwrap_or(true) {
+                                best_hit = Some(d);
+                            }
+                        }
+                    }
+
+                    let pivot = if let Some(d) = best_hit {
+                        Some(ray.get_point(d))
+                    } else if let Some(gd) =
+                        ray.intersect_plane(Vec3::ZERO, InfinitePlane3d::new(Vec3::Z))
+                    {
+                        if gd > 0.05 && gd <= MAX_PLANE_RAY_DIST {
+                            Some(ray.get_point(gd))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(target_pt) = pivot {
+                        orbit.reanchor_pivot(transform.translation, target_pt);
+                        focal_point.0 = target_pt;
+                    }
+                }
+            }
         }
     }
 
-    if !ui_capture.egui_wants_pointer && scroll.abs() > f32::EPSILON {
-        let zoom_factor = (1.0 - scroll * orbit.zoom_sensitivity).clamp(0.5, 1.8);
-        orbit.radius = (orbit.radius * zoom_factor).clamp(orbit.min_radius, orbit.max_radius);
+    if !mouse_buttons.pressed(MouseButton::Middle) {
+        orbit.is_mmb_dragging = false;
+        orbit.smoothed_delta = Vec2::ZERO;
     }
 
-    *transform = orbit.compute_transform(focal_point.0);
+    let dt = time.delta_seconds().clamp(0.0005, 0.1);
+    let blend = (1.0 - (-28.0 * dt).exp()).clamp(0.15, 1.0);
+    orbit.smoothed_delta = orbit.smoothed_delta.lerp(raw_delta, blend);
+
+    if orbit.is_mmb_dragging && orbit.smoothed_delta.length_squared() > 0.0001 {
+        let d = orbit.smoothed_delta;
+        if shift_held {
+            let right = transform.rotation * Vec3::X;
+            let up = transform.rotation * Vec3::Y;
+            let scale = orbit.target_radius.max(1.0) * orbit.pan_sensitivity;
+            orbit.target_focus += (-d.x * scale * right) + (d.y * scale * up);
+        } else {
+            orbit.target_azimuth -= d.x * orbit.orbit_sensitivity;
+            orbit.target_elevation = (orbit.target_elevation + d.y * orbit.orbit_sensitivity)
+                .clamp(-PITCH_LIMIT_RAD, PITCH_LIMIT_RAD);
+        }
+    }
+
+    if !ui_capture.egui_wants_pointer && wheel.abs() > f32::EPSILON {
+        let factor = (1.0 - wheel * orbit.zoom_sensitivity).clamp(0.5, 1.8);
+        orbit.target_radius =
+            (orbit.target_radius * factor).clamp(orbit.min_radius, orbit.max_radius);
+    }
+
+    let alpha = (1.0 - (-orbit.damping * dt).exp()).clamp(0.05, 1.0);
+    orbit.azimuth += (orbit.target_azimuth - orbit.azimuth) * alpha;
+    orbit.elevation = (orbit.elevation + (orbit.target_elevation - orbit.elevation) * alpha)
+        .clamp(-PITCH_LIMIT_RAD, PITCH_LIMIT_RAD);
+    orbit.radius = (orbit.radius + (orbit.target_radius - orbit.radius) * alpha)
+        .clamp(orbit.min_radius, orbit.max_radius);
+    focal_point.0 = focal_point.0.lerp(orbit.target_focus, alpha);
+
+    if !orbit.is_mmb_dragging && (orbit.target_azimuth - orbit.azimuth).abs() < 1e-4 {
+        orbit.azimuth %= TAU;
+        orbit.target_azimuth = orbit.azimuth;
+    }
+
+    *transform = orbit.build_transform(focal_point.0);
 }
 
-// ============================================================================
-// 3D ENVIRONMENT, GROUND GRID, SKETCHUP AXES & INITIAL SCENE SETUP
-// ============================================================================
-
-fn setup_cad_environment_and_lighting(
+fn init_cad_scene_and_lights(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let ground_mesh = meshes.add(Plane3d::default().mesh().size(400.0, 400.0));
-    let ground_material = materials.add(StandardMaterial {
+    let floor_mesh = meshes.add(Plane3d::default().mesh().size(400.0, 400.0));
+    let floor_mat = materials.add(StandardMaterial {
         base_color: Color::srgba(0.19, 0.21, 0.24, 0.88),
         alpha_mode: AlphaMode::Blend,
         perceptual_roughness: 0.92,
-        metallic: 0.0,
         reflectance: 0.08,
         double_sided: true,
         cull_mode: None,
@@ -431,8 +641,8 @@ fn setup_cad_environment_and_lighting(
 
     commands.spawn((
         PbrBundle {
-            mesh: ground_mesh,
-            material: ground_material,
+            mesh: floor_mesh,
+            material: floor_mat,
             transform: Transform {
                 translation: Vec3::new(0.0, 0.0, -0.004),
                 rotation: Quat::from_rotation_x(FRAC_PI_2),
@@ -443,8 +653,7 @@ fn setup_cad_environment_and_lighting(
         NotShadowCaster,
     ));
 
-    let grid_mesh = meshes.add(build_xy_ground_grid_mesh(100, 1.0, 5));
-    let unlit_vertex_color_mat = materials.add(StandardMaterial {
+    let unlit_mat = materials.add(StandardMaterial {
         base_color: Color::WHITE,
         unlit: true,
         alpha_mode: AlphaMode::Blend,
@@ -453,96 +662,57 @@ fn setup_cad_environment_and_lighting(
 
     commands.spawn((
         PbrBundle {
-            mesh: grid_mesh,
-            material: unlit_vertex_color_mat.clone(),
+            mesh: meshes.add(create_ground_grid_mesh(100, 1.0, 5)),
+            material: unlit_mat.clone(),
             transform: Transform::from_xyz(0.0, 0.0, -0.001),
             ..default()
         },
         NotShadowCaster,
     ));
 
-    let axis_length = 120.0_f32;
-    let axis_radius = 0.024_f32;
-    let axis_cylinder_mesh = meshes.add(Cylinder::new(axis_radius, axis_length));
+    let axis_len = 120.0_f32;
+    let cyl = meshes.add(Cylinder::new(0.024, axis_len));
 
-    let x_mat = materials.add(StandardMaterial {
-        base_color: AXIS_RED_COLOR,
-        unlit: true,
-        ..default()
-    });
-    let y_mat = materials.add(StandardMaterial {
-        base_color: AXIS_GREEN_COLOR,
-        unlit: true,
-        ..default()
-    });
-    let z_mat = materials.add(StandardMaterial {
-        base_color: AXIS_BLUE_COLOR,
-        unlit: true,
-        ..default()
-    });
-
-    commands.spawn((
-        PbrBundle {
-            mesh: axis_cylinder_mesh.clone(),
-            material: x_mat,
-            transform: Transform {
-                translation: Vec3::new(axis_length * 0.5, 0.0, 0.0),
-                rotation: Quat::from_rotation_z(-FRAC_PI_2),
-                scale: Vec3::ONE,
-            },
-            ..default()
-        },
-        NotShadowCaster,
-    ));
-
-    commands.spawn((
-        PbrBundle {
-            mesh: axis_cylinder_mesh.clone(),
-            material: y_mat,
-            transform: Transform {
-                translation: Vec3::new(0.0, axis_length * 0.5, 0.0),
-                rotation: Quat::IDENTITY,
-                scale: Vec3::ONE,
-            },
-            ..default()
-        },
-        NotShadowCaster,
-    ));
-
-    commands.spawn((
-        PbrBundle {
-            mesh: axis_cylinder_mesh,
-            material: z_mat,
-            transform: Transform {
-                translation: Vec3::new(0.0, 0.0, axis_length * 0.5),
-                rotation: Quat::from_rotation_x(FRAC_PI_2),
-                scale: Vec3::ONE,
-            },
-            ..default()
-        },
-        NotShadowCaster,
-    ));
-
-    let axes_line_mesh = meshes.add(build_coordinate_axes_line_mesh(axis_length));
-    commands.spawn((
-        PbrBundle {
-            mesh: axes_line_mesh,
-            material: unlit_vertex_color_mat,
-            transform: Transform::IDENTITY,
-            ..default()
-        },
-        NotShadowCaster,
-    ));
-
-    commands.spawn((
-        PbrBundle {
-            mesh: meshes.add(Sphere::new(0.06)),
-            material: materials.add(StandardMaterial {
-                base_color: Color::srgb(0.96, 0.96, 0.98),
-                unlit: true,
+    for (color, pos, rot) in [
+        (
+            AXIS_RED_COLOR,
+            Vec3::new(axis_len * 0.5, 0.0, 0.0),
+            Quat::from_rotation_z(-FRAC_PI_2),
+        ),
+        (
+            AXIS_GREEN_COLOR,
+            Vec3::new(0.0, axis_len * 0.5, 0.0),
+            Quat::IDENTITY,
+        ),
+        (
+            AXIS_BLUE_COLOR,
+            Vec3::new(0.0, 0.0, axis_len * 0.5),
+            Quat::from_rotation_x(FRAC_PI_2),
+        ),
+    ] {
+        commands.spawn((
+            PbrBundle {
+                mesh: cyl.clone(),
+                material: materials.add(StandardMaterial {
+                    base_color: color,
+                    unlit: true,
+                    ..default()
+                }),
+                transform: Transform {
+                    translation: pos,
+                    rotation: rot,
+                    scale: Vec3::ONE,
+                },
                 ..default()
-            }),
-            transform: Transform::IDENTITY,
+            },
+            NotShadowCaster,
+        ));
+    }
+
+    commands.spawn((
+        PbrBundle {
+            mesh: meshes.add(create_axes_line_mesh(axis_len)),
+            material: unlit_mat,
             ..default()
         },
         NotShadowCaster,
@@ -571,25 +741,22 @@ fn setup_cad_environment_and_lighting(
     });
 }
 
-fn setup_block_preview_entity(
+fn init_block_preview_mesh(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let unit_cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
-    let preview_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.24, 0.68, 0.98, 0.34),
-        alpha_mode: AlphaMode::Blend,
-        unlit: true,
-        double_sided: true,
-        cull_mode: None,
-        ..default()
-    });
-
     commands.spawn((
         PbrBundle {
-            mesh: unit_cube,
-            material: preview_material,
+            mesh: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
+            material: materials.add(StandardMaterial {
+                base_color: Color::srgba(0.24, 0.68, 0.98, 0.34),
+                alpha_mode: AlphaMode::Blend,
+                unlit: true,
+                double_sided: true,
+                cull_mode: None,
+                ..default()
+            }),
             visibility: Visibility::Hidden,
             ..default()
         },
@@ -598,29 +765,41 @@ fn setup_block_preview_entity(
     ));
 }
 
-fn seed_initial_cad_scene(world: &mut World) {
-    let starter_commands: Vec<Box<dyn Command + Send + Sync>> = vec![
+fn populate_starter_geometry(world: &mut World) {
+    let initial: Vec<Box<dyn Command + Send + Sync>> = vec![
         Box::new(CreateBlockCommand::from_corner_and_dimensions(
             Vec3::new(-3.0, 1.0, 0.0),
-            Vec3::new(2.0, 2.0, 1.5),
+            Vec3::new(2.0, 2.0, 2.0),
             Color::srgb(0.76, 0.80, 0.86),
             Some(GroupId(1)),
         )),
         Box::new(DrawLineCommand::new(
             Vec3::new(1.0, 1.0, 0.0),
-            Vec3::new(4.0, 3.0, 0.0),
-            Color::srgb(0.92, 0.62, 0.22),
-            Some(GroupId(1)),
+            Vec3::new(4.0, 1.0, 0.0),
+            AXIS_RED_COLOR,
+            Some(GroupId(2)),
         )),
         Box::new(DrawLineCommand::new(
-            Vec3::new(4.0, 3.0, 0.0),
-            Vec3::new(4.0, 3.0, 2.0),
-            AXIS_BLUE_COLOR,
-            Some(GroupId(1)),
+            Vec3::new(4.0, 1.0, 0.0),
+            Vec3::new(4.0, 4.0, 0.0),
+            AXIS_GREEN_COLOR,
+            Some(GroupId(2)),
+        )),
+        Box::new(DrawLineCommand::new(
+            Vec3::new(4.0, 4.0, 0.0),
+            Vec3::new(1.0, 4.0, 0.0),
+            AXIS_RED_COLOR,
+            Some(GroupId(2)),
+        )),
+        Box::new(DrawLineCommand::new(
+            Vec3::new(1.0, 4.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            AXIS_GREEN_COLOR,
+            Some(GroupId(2)),
         )),
     ];
 
-    for mut cmd in starter_commands {
+    for mut cmd in initial {
         cmd.execute(world);
         if let Some(mut history) = world.get_resource_mut::<CommandHistory>() {
             history.undo_stack.push(cmd);
@@ -629,176 +808,260 @@ fn seed_initial_cad_scene(world: &mut World) {
     }
 }
 
-fn build_xy_ground_grid_mesh(half_extents: i32, spacing: f32, major_every: i32) -> Mesh {
-    let extent = half_extents as f32 * spacing;
-    let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut colors: Vec<[f32; 4]> = Vec::new();
+fn create_ground_grid_mesh(half_count: i32, step: f32, major_interval: i32) -> Mesh {
+    let span = half_count as f32 * step;
+    let mut pts: Vec<[f32; 3]> = Vec::new();
+    let mut cols: Vec<[f32; 4]> = Vec::new();
+    let minor = [0.34, 0.37, 0.42, 0.52];
+    let major = [0.50, 0.54, 0.60, 0.82];
 
-    let minor_color = [0.34, 0.37, 0.42, 0.52];
-    let major_color = [0.50, 0.54, 0.60, 0.82];
-
-    for i in -half_extents..=half_extents {
-        let offset = i as f32 * spacing;
-        let is_major = major_every > 0 && (i % major_every == 0);
-        let color = if is_major { major_color } else { minor_color };
+    for i in -half_count..=half_count {
+        let d = i as f32 * step;
+        let col = if major_interval > 0 && i % major_interval == 0 {
+            major
+        } else {
+            minor
+        };
 
         if i == 0 {
-            positions.push([-extent, 0.0, 0.0]);
-            positions.push([0.0, 0.0, 0.0]);
-            colors.push(major_color);
-            colors.push(major_color);
-
-            positions.push([0.0, -extent, 0.0]);
-            positions.push([0.0, 0.0, 0.0]);
-            colors.push(major_color);
-            colors.push(major_color);
+            pts.extend([[-span, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, -span, 0.0], [0.0, 0.0, 0.0]]);
+            cols.extend([major, major, major, major]);
             continue;
         }
 
-        positions.push([-extent, offset, 0.0]);
-        positions.push([extent, offset, 0.0]);
-        colors.push(color);
-        colors.push(color);
-
-        positions.push([offset, -extent, 0.0]);
-        positions.push([offset, extent, 0.0]);
-        colors.push(color);
-        colors.push(color);
+        pts.extend([[-span, d, 0.0], [span, d, 0.0], [d, -span, 0.0], [d, span, 0.0]]);
+        cols.extend([col, col, col, col]);
     }
 
-    let indices: Vec<u32> = (0..positions.len() as u32).collect();
+    let idx: Vec<u32> = (0..pts.len() as u32).collect();
     let mut mesh = Mesh::new(
         PrimitiveTopology::LineList,
         RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
     );
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
-    mesh.insert_indices(Indices::U32(indices));
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, pts);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, cols);
+    mesh.insert_indices(Indices::U32(idx));
     mesh
 }
 
-fn build_coordinate_axes_line_mesh(length: f32) -> Mesh {
+fn create_axes_line_mesh(len: f32) -> Mesh {
     let r = AXIS_RED_COLOR.to_linear().to_f32_array();
     let g = AXIS_GREEN_COLOR.to_linear().to_f32_array();
     let b = AXIS_BLUE_COLOR.to_linear().to_f32_array();
-
-    let positions = vec![
-        [0.0, 0.0, 0.0],
-        [length, 0.0, 0.0],
-        [0.0, 0.0, 0.0],
-        [0.0, length, 0.0],
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, length],
-    ];
-    let colors = vec![r, r, g, g, b, b];
-    let indices = vec![0, 1, 2, 3, 4, 5];
-
     let mut mesh = Mesh::new(
         PrimitiveTopology::LineList,
         RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
     );
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
-    mesh.insert_indices(Indices::U32(indices));
+    mesh.insert_attribute(
+        Mesh::ATTRIBUTE_POSITION,
+        vec![
+            [0.0, 0.0, 0.0],
+            [len, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, len, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, len],
+        ],
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![r, r, g, g, b, b]);
+    mesh.insert_indices(Indices::U32(vec![0, 1, 2, 3, 4, 5]));
     mesh
 }
 
-// ============================================================================
-// RAYCASTING, SHIFT VERTICAL Z-LOCK & 2-DEGREE PARALLEL INFERENCE ENGINE
-// ============================================================================
+fn snap_to_integer_grid(pt: Vec3) -> Vec3 {
+    Vec3::new(
+        (pt.x / GRID_SNAP_STEP).round() * GRID_SNAP_STEP,
+        (pt.y / GRID_SNAP_STEP).round() * GRID_SNAP_STEP,
+        (pt.z / GRID_SNAP_STEP).round() * GRID_SNAP_STEP,
+    )
+}
 
-/// Evaluates primary axis alignment (Red/Green/Blue) and scans all neighbor `CadObject`
-/// edges within `NEIGHBOR_PROXIMITY_RADIUS` to snap within `2.0°` (`PARALLEL_SNAP_MAX_ANGLE_DEG`).
-fn compute_snapped_vector_and_inference<'a>(
-    anchor: Vec3,
-    raw_target: Vec3,
-    excluded_entity: Option<Entity>,
-    cad_objects: impl Iterator<Item = (Entity, &'a CadObject)>,
-) -> (Vec3, AxisInference) {
-    let delta = raw_target - anchor;
-    let len = delta.length();
-    if len <= 0.04 {
-        return (raw_target, AxisInference::None);
-    }
+/// Discovers a closed 2D face perimeter (from a hovered Block) or a connected chain of `CadObject`
+/// lines connected to the hovered/selected line entity.
+fn detect_offset_contour_for_entity(
+    seed_entity: Entity,
+    cad_objects: &Query<(Entity, &CadObject, &mut Transform)>,
+    selected: &SelectedCadObjects,
+) -> Option<OffsetContour> {
+    let Ok((_, seed_obj, _)) = cad_objects.get(seed_entity) else {
+        return None;
+    };
 
-    let dir = delta / len;
-    let primary_cos_threshold = 0.990_f32;
-
-    if dir.x.abs() >= primary_cos_threshold {
-        return (
-            Vec3::new(raw_target.x, anchor.y, anchor.z),
-            AxisInference::RedX,
-        );
-    }
-    if dir.y.abs() >= primary_cos_threshold {
-        return (
-            Vec3::new(anchor.x, raw_target.y, anchor.z),
-            AxisInference::GreenY,
-        );
-    }
-    if dir.z.abs() >= primary_cos_threshold {
-        return (
-            Vec3::new(anchor.x, anchor.y, raw_target.z),
-            AxisInference::BlueZ,
-        );
-    }
-
-    // Neighbor Parallel Inference: check if `dir` is within 2.0 degrees of any neighbor's edge
-    let mut best_neighbor_match: Option<(f32, Vec3, Vec3, Vec3)> = None;
-
-    for (entity, obj) in cad_objects {
-        if Some(entity) == excluded_entity {
-            continue;
+    match seed_obj.geometry {
+        CadGeometryKind::Block { center, size } => {
+            let half = size * 0.5;
+            let top_z = center.z + half.z;
+            let c0 = Vec3::new(center.x - half.x, center.y - half.y, top_z);
+            let c1 = Vec3::new(center.x + half.x, center.y - half.y, top_z);
+            let c2 = Vec3::new(center.x + half.x, center.y + half.y, top_z);
+            let c3 = Vec3::new(center.x - half.x, center.y + half.y, top_z);
+            Some(OffsetContour {
+                segments: vec![(c0, c1), (c1, c2), (c2, c3), (c3, c0)],
+                center: Vec3::new(center.x, center.y, top_z),
+                plane_z: top_z,
+                group_id: seed_obj.group_id,
+            })
         }
-        if obj.geometry.center().distance(anchor) > NEIGHBOR_PROXIMITY_RADIUS {
-            continue;
-        }
+        CadGeometryKind::Line { start, end, .. } => {
+            let plane_z = start.z;
+            let mut pool: Vec<(Entity, Vec3, Vec3)> = Vec::new();
 
-        for (edge_start, edge_end) in obj.geometry.edges() {
-            let edge_vec = edge_end - edge_start;
-            let edge_len = edge_vec.length();
-            if edge_len <= 0.05 {
-                continue;
-            }
-            let edge_dir = edge_vec / edge_len;
-
-            // Skip edges that are already purely along global X, Y, or Z
-            if edge_dir.x.abs() > 0.999 || edge_dir.y.abs() > 0.999 || edge_dir.z.abs() > 0.999 {
-                continue;
-            }
-
-            let cos_angle = dir.dot(edge_dir).abs().clamp(0.0, 1.0);
-            let angle_deg = cos_angle.acos().to_degrees();
-
-            if angle_deg <= PARALLEL_SNAP_MAX_ANGLE_DEG {
-                let is_better = best_neighbor_match
-                    .map(|(best_deg, _, _, _)| angle_deg < best_deg)
-                    .unwrap_or(true);
-                if is_better {
-                    best_neighbor_match = Some((angle_deg, edge_start, edge_end, edge_dir));
+            for (ent, obj, _) in cad_objects.iter() {
+                if let CadGeometryKind::Line {
+                    start: s, end: e, ..
+                } = obj.geometry
+                {
+                    if (s.z - plane_z).abs() <= 0.15 && (e.z - plane_z).abs() <= 0.15 {
+                        pool.push((ent, s, e));
+                    }
                 }
             }
+
+            // If multiple lines are explicitly selected, prioritize the selected chain
+            let mut chain: Vec<(Vec3, Vec3)> = Vec::new();
+            let mut used: Vec<Entity> = vec![seed_entity];
+            chain.push((start, end));
+
+            let mut head = start;
+            let mut tail = end;
+
+            // Grow the connected polyline chain forward and backward
+            loop {
+                let mut extended = false;
+                for &(ent, s, e) in &pool {
+                    if used.contains(&ent) {
+                        continue;
+                    }
+                    if selected.entities.len() > 1 && !selected.entities.contains(&ent) {
+                        continue;
+                    }
+                    if tail.distance(s) <= 0.08 {
+                        chain.push((s, e));
+                        tail = e;
+                        used.push(ent);
+                        extended = true;
+                        break;
+                    } else if tail.distance(e) <= 0.08 {
+                        chain.push((e, s));
+                        tail = s;
+                        used.push(ent);
+                        extended = true;
+                        break;
+                    } else if head.distance(e) <= 0.08 {
+                        chain.insert(0, (s, e));
+                        head = s;
+                        used.push(ent);
+                        extended = true;
+                        break;
+                    } else if head.distance(s) <= 0.08 {
+                        chain.insert(0, (e, s));
+                        head = e;
+                        used.push(ent);
+                        extended = true;
+                        break;
+                    }
+                }
+                if !extended {
+                    break;
+                }
+            }
+
+            let mut sum = Vec3::ZERO;
+            for &(s, e) in &chain {
+                sum += (s + e) * 0.5;
+            }
+            let avg_center = sum / (chain.len() as f32);
+
+            Some(OffsetContour {
+                segments: chain,
+                center: avg_center,
+                plane_z,
+                group_id: seed_obj.group_id,
+            })
+        }
+    }
+}
+
+fn evaluate_axis_and_neighbor_snapping<'a>(
+    anchor: Vec3,
+    raw_pt: Vec3,
+    snapped_pt: Vec3,
+    excluded: Option<Entity>,
+    objects: impl Iterator<Item = (Entity, &'a CadObject)>,
+) -> (Vec3, AxisInference) {
+    let delta = raw_pt - anchor;
+    let dist = delta.length();
+    if dist <= 0.15 {
+        return (snapped_pt, AxisInference::None);
+    }
+
+    let dir = delta / dist;
+    let cos_limit = 0.985_f32;
+
+    if dir.x.abs() >= cos_limit {
+        let sx = (raw_pt.x / GRID_SNAP_STEP).round() * GRID_SNAP_STEP;
+        return (Vec3::new(sx, anchor.y, anchor.z), AxisInference::RedX);
+    }
+    if dir.y.abs() >= cos_limit {
+        let sy = (raw_pt.y / GRID_SNAP_STEP).round() * GRID_SNAP_STEP;
+        return (Vec3::new(anchor.x, sy, anchor.z), AxisInference::GreenY);
+    }
+    if dir.z.abs() >= cos_limit {
+        let sz = (raw_pt.z / GRID_SNAP_STEP).round() * GRID_SNAP_STEP;
+        return (Vec3::new(anchor.x, anchor.y, sz), AxisInference::BlueZ);
+    }
+
+    let mut best_match: Option<(f32, Vec3, Vec3, Vec3)> = None;
+    for (ent, obj) in objects {
+        if Some(ent) == excluded {
+            continue;
+        }
+        if obj.geometry.centroid().distance(anchor) > NEIGHBOR_SCAN_RADIUS {
+            continue;
+        }
+        for (es, ee) in obj.geometry.edge_segments() {
+            let ev = ee - es;
+            let el = ev.length();
+            if el <= 0.05 {
+                continue;
+            }
+            let ed = ev / el;
+            if ed.x.abs() > 0.999 || ed.y.abs() > 0.999 || ed.z.abs() > 0.999 {
+                continue;
+            }
+            let cos_a = dir.dot(ed).abs().clamp(0.0, 1.0);
+            let deg = cos_a.acos().to_degrees();
+            if deg <= PARALLEL_THRESHOLD_DEG
+                && best_match.map(|(b, _, _, _)| deg < b).unwrap_or(true)
+            {
+                best_match = Some((deg, es, ee, ed));
+            }
         }
     }
 
-    if let Some((_, edge_start, edge_end, edge_dir)) = best_neighbor_match {
-        let projected_len = delta.dot(edge_dir);
-        let snapped_end = anchor + edge_dir * projected_len;
+    if let Some((_, es, ee, ed)) = best_match {
+        let raw_proj = delta.dot(ed);
+        let snapped_proj = (raw_proj / GRID_SNAP_STEP).round() * GRID_SNAP_STEP;
+        let final_proj = if snapped_proj.abs() < GRID_SNAP_STEP {
+            raw_proj.signum() * GRID_SNAP_STEP
+        } else {
+            snapped_proj
+        };
         return (
-            snapped_end,
+            anchor + ed * final_proj,
             AxisInference::ParallelNeighbor {
-                edge_start,
-                edge_end,
-                direction: edge_dir,
+                edge_start: es,
+                edge_end: ee,
+                direction: ed,
             },
         );
     }
 
-    (raw_target, AxisInference::None)
+    (snapped_pt, AxisInference::None)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn update_mouse_raycasting_and_inference(
+fn compute_raycast_and_snapping(
     window_query: Query<&Window, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<OrbitCamera>>,
     keyboard: Res<ButtonInput<KeyCode>>,
@@ -807,6 +1070,7 @@ fn update_mouse_raycasting_and_inference(
     move_state: Res<MoveToolState>,
     scale_state: Res<ScaleToolState>,
     selected: Res<SelectedCadObjects>,
+    focal_point: Res<FocalPoint>,
     cad_objects: Query<(Entity, &CadObject)>,
     mut cursor_ray: ResMut<CursorRayState>,
     mut draft: ResMut<ToolDraftState>,
@@ -815,56 +1079,52 @@ fn update_mouse_raycasting_and_inference(
         cursor_ray.is_valid_hit = false;
         return;
     };
-    let Ok((camera, camera_transform)) = camera_query.get_single() else {
+    let Ok((camera, cam_transform)) = camera_query.get_single() else {
         cursor_ray.is_valid_hit = false;
         return;
     };
-    let Some(cursor_screen_pos) = window.cursor_position() else {
+    let Some(screen_pos) = window.cursor_position() else {
         cursor_ray.is_valid_hit = false;
         return;
     };
-    let Some(ray) = camera.viewport_to_world(camera_transform, cursor_screen_pos) else {
+    let Some(ray) = camera.viewport_to_world(cam_transform, screen_pos) else {
         cursor_ray.is_valid_hit = false;
         return;
     };
 
     let shift_held = keyboard.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
-    let mmb_pressed = mouse_buttons.pressed(MouseButton::Middle);
-    let snap_step = 0.05_f32;
+    let mmb_held = mouse_buttons.pressed(MouseButton::Middle);
+    let cam_fwd = cam_transform.forward();
 
-    // Determine active reference anchor (either LineDraw start point or MoveTool grab anchor)
     let active_anchor: Option<(Vec3, Option<Entity>)> = match tool_state.current {
-        CadTool::LineDraw => draft.active_start_point.map(|pt| (pt, None)),
+        CadTool::LineDraw => draft.active_start_point.map(|p| (p, None)),
         CadTool::Move => move_state
             .active_drag
             .as_ref()
-            .map(|drag| (drag.grab_anchor, Some(drag.entity))),
+            .map(|d| (d.grab_anchor, Some(d.entity))),
         _ => None,
     };
 
-    // 1. Shift-Locked Vertical Blue (Z) Axis Plane for LineDraw and Move tools
-    if shift_held && !mmb_pressed {
-        if let Some((anchor, excluded_entity)) = active_anchor {
-            let cam_pos = camera_transform.translation();
-            let to_cam_xy = Vec3::new(cam_pos.x - anchor.x, cam_pos.y - anchor.y, 0.0);
-            let plane_normal = Dir3::new(to_cam_xy).unwrap_or(Dir3::X);
+    if shift_held && !mmb_held {
+        if let Some((anchor, excluded)) = active_anchor {
+            let eye = cam_transform.translation();
+            let horiz_to_eye = Vec3::new(eye.x - anchor.x, eye.y - anchor.y, 0.0);
+            let p_norm = Dir3::new(horiz_to_eye).unwrap_or(Dir3::X);
 
-            if let Some(distance) = ray.intersect_plane(anchor, InfinitePlane3d::new(plane_normal))
-            {
-                let hit_point = ray.get_point(distance);
-                let mut snapped_z = (hit_point.z / snap_step).round() * snap_step;
-                let mut inference = AxisInference::BlueZ;
+            if let Some(d) = ray.intersect_plane(anchor, InfinitePlane3d::new(p_norm)) {
+                let hit = ray.get_point(d);
+                let mut sz = (hit.z / GRID_SNAP_STEP).round() * GRID_SNAP_STEP;
+                let mut inf = AxisInference::BlueZ;
 
-                // Snap flush with any neighbor Block top face
                 for (ent, obj) in cad_objects.iter() {
-                    if Some(ent) == excluded_entity {
+                    if Some(ent) == excluded {
                         continue;
                     }
                     if let CadGeometryKind::Block { center, size } = obj.geometry {
                         let top_z = center.z + size.z * 0.5;
-                        if (snapped_z - top_z).abs() <= 0.14 {
-                            snapped_z = top_z;
-                            inference = AxisInference::FlushTopFace {
+                        if (hit.z - top_z).abs() <= 0.35 {
+                            sz = top_z;
+                            inf = AxisInference::FlushTopFace {
                                 elevation_z: top_z,
                                 face_center: Vec3::new(center.x, center.y, top_z),
                             };
@@ -873,13 +1133,14 @@ fn update_mouse_raycasting_and_inference(
                     }
                 }
 
-                let vertical_pos = Vec3::new(anchor.x, anchor.y, snapped_z);
-                cursor_ray.raw_ground_hit = hit_point;
-                cursor_ray.snapped_pos = vertical_pos;
+                let vert_pt = Vec3::new(anchor.x, anchor.y, sz);
+                cursor_ray.raw_ground_hit = hit;
+                cursor_ray.snapped_pos = vert_pt;
                 cursor_ray.is_valid_hit = true;
                 cursor_ray.vertical_z_locked = true;
-                cursor_ray.inference = inference;
-                draft.current_preview_end = vertical_pos;
+                cursor_ray.inference = inf;
+                cursor_ray.active_plane = DynamicDrawingPlane::VerticalXZ;
+                draft.current_preview_end = vert_pt;
                 return;
             }
         }
@@ -887,26 +1148,24 @@ fn update_mouse_raycasting_and_inference(
 
     cursor_ray.vertical_z_locked = false;
 
-    // 2. If dragging a 3D Scale handle, project ray onto camera-facing plane through handle
     if tool_state.current == CadTool::Scale {
         if let Some(ref drag) = scale_state.active_drag {
-            let cam_forward = camera_transform.forward();
-            if let Some(dist) =
-                ray.intersect_plane(drag.initial_handle_pos, InfinitePlane3d::new(*cam_forward))
+            if let Some(d) =
+                ray.intersect_plane(drag.initial_handle_pos, InfinitePlane3d::new(*cam_fwd))
             {
-                let hit = ray.get_point(dist);
+                let hit = ray.get_point(d);
                 cursor_ray.raw_ground_hit = hit;
                 cursor_ray.snapped_pos = hit;
                 cursor_ray.is_valid_hit = true;
                 cursor_ray.inference = AxisInference::None;
+                cursor_ray.active_plane = DynamicDrawingPlane::CameraFacing;
                 draft.current_preview_end = hit;
                 return;
             }
         }
     }
 
-    // 3. Flush Top-Face detection when hovering over existing Blocks
-    let mut best_top_face_hit: Option<(f32, Vec3, f32, Vec3)> = None;
+    let mut top_face_match: Option<(f32, Vec3, f32, Vec3)> = None;
     if active_anchor.is_none() {
         for (ent, obj) in cad_objects.iter() {
             if tool_state.current == CadTool::Move && selected.entities.contains(&ent) {
@@ -914,22 +1173,18 @@ fn update_mouse_raycasting_and_inference(
             }
             if let CadGeometryKind::Block { center, size } = obj.geometry {
                 let top_z = center.z + size.z * 0.5;
-                let half_x = size.x * 0.5;
-                let half_y = size.y * 0.5;
-                let plane_origin = Vec3::new(center.x, center.y, top_z);
-
-                if let Some(dist) = ray.intersect_plane(plane_origin, InfinitePlane3d::new(Vec3::Z))
-                {
-                    let pt = ray.get_point(dist);
-                    if (pt.x - center.x).abs() <= half_x + 0.08
-                        && (pt.y - center.y).abs() <= half_y + 0.08
-                    {
-                        let is_closer = best_top_face_hit
-                            .map(|(best_d, _, _, _)| dist < best_d)
-                            .unwrap_or(true);
-                        if is_closer {
-                            best_top_face_hit =
-                                Some((dist, pt, top_z, Vec3::new(center.x, center.y, top_z)));
+                let hx = size.x * 0.5;
+                let hy = size.y * 0.5;
+                let origin = Vec3::new(center.x, center.y, top_z);
+                if let Some(d) = ray.intersect_plane(origin, InfinitePlane3d::new(Vec3::Z)) {
+                    if d <= MAX_PLANE_RAY_DIST {
+                        let p = ray.get_point(d);
+                        if (p.x - center.x).abs() <= hx + 0.15 && (p.y - center.y).abs() <= hy + 0.15
+                        {
+                            if top_face_match.map(|(b, _, _, _)| d < b).unwrap_or(true) {
+                                top_face_match =
+                                    Some((d, p, top_z, Vec3::new(center.x, center.y, top_z)));
+                            }
                         }
                     }
                 }
@@ -937,48 +1192,80 @@ fn update_mouse_raycasting_and_inference(
         }
     }
 
-    let reference_z = match active_anchor {
-        Some((anchor, _)) => anchor.z,
+    let plane_origin = match active_anchor {
+        Some((anchor, _)) => anchor,
         None => draft
             .active_start_point
-            .map(|s| s.z)
-            .or_else(|| best_top_face_hit.map(|(_, _, tz, _)| tz))
-            .unwrap_or(0.0),
-    };
-    let plane_origin = Vec3::new(0.0, 0.0, reference_z);
-
-    let Some(distance) = ray.intersect_plane(plane_origin, InfinitePlane3d::new(Vec3::Z)) else {
-        cursor_ray.is_valid_hit = false;
-        return;
+            .or_else(|| top_face_match.map(|(_, _, tz, _)| Vec3::new(focal_point.0.x, focal_point.0.y, tz)))
+            .unwrap_or(Vec3::new(focal_point.0.x, focal_point.0.y, 0.0)),
     };
 
-    let raw_hit = ray.get_point(distance);
-    let mut candidate = Vec3::new(
-        (raw_hit.x / snap_step).round() * snap_step,
-        (raw_hit.y / snap_step).round() * snap_step,
-        reference_z,
-    );
+    let mut plane_mode =
+        DynamicDrawingPlane::choose_for_view(Vec3::from(cam_fwd), active_anchor.is_some());
+    let norm = plane_mode.normal_dir(cam_fwd);
 
-    let mut inference = if let Some((_, _, elevation_z, face_center)) = best_top_face_hit {
+    let raw_hit = if let Some(d) = ray.intersect_plane(plane_origin, InfinitePlane3d::new(norm)) {
+        if d > 0.05 && d <= MAX_PLANE_RAY_DIST {
+            ray.get_point(d)
+        } else {
+            plane_mode = DynamicDrawingPlane::CameraFacing;
+            let fb_origin = active_anchor
+                .map(|(a, _)| a)
+                .or(draft.active_start_point)
+                .unwrap_or(focal_point.0);
+            let Some(fb_d) = ray.intersect_plane(fb_origin, InfinitePlane3d::new(-cam_fwd)) else {
+                cursor_ray.is_valid_hit = false;
+                return;
+            };
+            let mut pt = ray.get_point(fb_d);
+            if active_anchor.is_none() && draft.active_start_point.is_none() {
+                pt.z = pt.z.max(0.0);
+            }
+            pt
+        }
+    } else {
+        plane_mode = DynamicDrawingPlane::CameraFacing;
+        let fb_origin = active_anchor
+            .map(|(a, _)| a)
+            .or(draft.active_start_point)
+            .unwrap_or(focal_point.0);
+        let Some(fb_d) = ray.intersect_plane(fb_origin, InfinitePlane3d::new(-cam_fwd)) else {
+            cursor_ray.is_valid_hit = false;
+            return;
+        };
+        let mut pt = ray.get_point(fb_d);
+        if active_anchor.is_none() && draft.active_start_point.is_none() {
+            pt.z = pt.z.max(0.0);
+        }
+        pt
+    };
+
+    let mut candidate = snap_to_integer_grid(raw_hit);
+    if plane_mode == DynamicDrawingPlane::HorizontalXY {
+        candidate.z = plane_origin.z;
+    }
+
+    let mut inference = if let Some((_, _, tz, fc)) = top_face_match {
+        candidate.z = tz;
         AxisInference::FlushTopFace {
-            elevation_z,
-            face_center,
+            elevation_z: tz,
+            face_center: fc,
         }
     } else {
         AxisInference::None
     };
 
-    // 4. Evaluate Red/Green/Blue Axis & 2-Degree Parallel Neighbor Inference for LineDraw and Move
-    if let Some((anchor, excluded_entity)) = active_anchor {
-        let (snapped_pt, detected_inference) = compute_snapped_vector_and_inference(
+    if let Some((anchor, excluded)) = active_anchor {
+        let (snapped_pt, det_inf) = evaluate_axis_and_neighbor_snapping(
             anchor,
+            raw_hit,
             candidate,
-            excluded_entity,
+            excluded,
             cad_objects.iter(),
         );
         candidate = snapped_pt;
-        if detected_inference != AxisInference::None {
-            inference = detected_inference;
+        if det_inf != AxisInference::None {
+            inference = det_inf;
         }
     }
 
@@ -986,15 +1273,12 @@ fn update_mouse_raycasting_and_inference(
     cursor_ray.snapped_pos = candidate;
     cursor_ray.is_valid_hit = true;
     cursor_ray.inference = inference;
+    cursor_ray.active_plane = plane_mode;
     draft.current_preview_end = candidate;
 }
 
-// ============================================================================
-// KEYBOARD VCB INPUT & HOTKEYS (SPACE, L, B, M, S, DEL/BACKSPACE, ESC, CTRL+Z/Y/Q)
-// ============================================================================
-
 #[allow(clippy::too_many_arguments)]
-fn capture_keyboard_vcb_and_shortcuts(
+fn process_keyboard_and_vcb_events(
     mut keyboard_events: EventReader<KeyboardInput>,
     keyboard_state: Res<ButtonInput<KeyCode>>,
     ui_capture: Res<UiInputCapture>,
@@ -1004,6 +1288,7 @@ fn capture_keyboard_vcb_and_shortcuts(
     mut draft: ResMut<ToolDraftState>,
     mut move_state: ResMut<MoveToolState>,
     mut scale_state: ResMut<ScaleToolState>,
+    mut offset_state: ResMut<OffsetToolState>,
     mut selected: ResMut<SelectedCadObjects>,
     mut pending_actions: ResMut<PendingHistoryActions>,
     mut cad_query: Query<(Entity, &CadObject, &mut Transform)>,
@@ -1021,18 +1306,15 @@ fn capture_keyboard_vcb_and_shortcuts(
             continue;
         }
 
-        // Ctrl + Q -> Exit Application cleanly
         if ctrl_held && event.key_code == KeyCode::KeyQ {
             app_exit_events.send(AppExit::Success);
             continue;
         }
 
-        // Ctrl + Z / Ctrl + Y -> Undo / Redo
         if ctrl_held {
             if event.key_code == KeyCode::KeyZ {
+                abort_active_drags(&mut move_state, &mut scale_state, &mut offset_state, &mut cad_query);
                 draft.active_start_point = None;
-                move_state.active_drag = None;
-                scale_state.active_drag = None;
                 if shift_held {
                     pending_actions.queue.push(HistoryAction::Redo);
                 } else {
@@ -1040,45 +1322,43 @@ fn capture_keyboard_vcb_and_shortcuts(
                 }
                 continue;
             } else if event.key_code == KeyCode::KeyY {
+                abort_active_drags(&mut move_state, &mut scale_state, &mut offset_state, &mut cad_query);
                 draft.active_start_point = None;
-                move_state.active_drag = None;
-                scale_state.active_drag = None;
                 pending_actions.queue.push(HistoryAction::Redo);
                 continue;
             }
         }
 
-        // Single-key tool hotkeys: [Space], [L], [B], [M], [S]
+        // Tool Hotkeys: [Space], [L], [B], [M], [S], [F] (Offset Tool)
         if !ctrl_held {
-            let switched_tool = match event.key_code {
+            let next_tool = match event.key_code {
                 KeyCode::Space => Some(CadTool::Select),
                 KeyCode::KeyL => Some(CadTool::LineDraw),
                 KeyCode::KeyB => Some(CadTool::Block),
                 KeyCode::KeyM => Some(CadTool::Move),
                 KeyCode::KeyS => Some(CadTool::Scale),
+                KeyCode::KeyF => Some(CadTool::Offset),
                 _ => None,
             };
 
-            if let Some(new_tool) = switched_tool {
-                cancel_in_progress_drags(&mut move_state, &mut scale_state, &mut cad_query);
-                tool_state.current = new_tool;
+            if let Some(tool) = next_tool {
+                abort_active_drags(&mut move_state, &mut scale_state, &mut offset_state, &mut cad_query);
+                tool_state.current = tool;
                 draft.active_start_point = None;
                 vcb.buffer.clear();
-                vcb.last_status_message = Some(format!("Activated {}", new_tool.label()));
+                vcb.last_status_message = Some(format!("Activated {}", tool.label()));
                 continue;
             }
         }
 
-        // [Escape] -> Cancel current operation / break continuous line chain
         if event.key_code == KeyCode::Escape || matches!(event.logical_key, Key::Escape) {
-            cancel_in_progress_drags(&mut move_state, &mut scale_state, &mut cad_query);
+            abort_active_drags(&mut move_state, &mut scale_state, &mut offset_state, &mut cad_query);
             draft.active_start_point = None;
             vcb.buffer.clear();
-            vcb.last_status_message = Some(String::from("Operation canceled / chain broken"));
+            vcb.last_status_message = Some(String::from("Operation canceled"));
             continue;
         }
 
-        // [Backspace] -> Edit VCB buffer if non-empty; otherwise delete selected object(s)
         if event.key_code == KeyCode::Backspace || matches!(event.logical_key, Key::Backspace) {
             if !vcb.buffer.is_empty() {
                 vcb.buffer.pop();
@@ -1086,17 +1366,16 @@ fn capture_keyboard_vcb_and_shortcuts(
             }
         }
 
-        // [Delete / Backspace (when VCB empty)] -> Delete Selected Object(s) via `DeleteCommand`
         if event.key_code == KeyCode::Delete
             || matches!(event.logical_key, Key::Delete)
             || (event.key_code == KeyCode::Backspace && vcb.buffer.is_empty())
         {
             if !selected.entities.is_empty() {
-                cancel_in_progress_drags(&mut move_state, &mut scale_state, &mut cad_query);
+                abort_active_drags(&mut move_state, &mut scale_state, &mut offset_state, &mut cad_query);
                 let mut snapshots = Vec::new();
-                for &entity in &selected.entities {
-                    if let Ok((ent, obj, _)) = cad_query.get(entity) {
-                        snapshots.push((ent, obj.clone()));
+                for &ent in &selected.entities {
+                    if let Ok((e, obj, _)) = cad_query.get(ent) {
+                        snapshots.push((e, obj.clone()));
                     }
                 }
                 selected.entities.clear();
@@ -1112,22 +1391,22 @@ fn capture_keyboard_vcb_and_shortcuts(
             continue;
         }
 
-        // [Enter] -> Parse VCB buffer and commit command
         if event.key_code == KeyCode::Enter
             || event.key_code == KeyCode::NumpadEnter
             || matches!(event.logical_key, Key::Enter)
         {
-            let input_text = vcb.buffer.trim().to_string();
+            let text = vcb.buffer.trim().to_string();
             vcb.buffer.clear();
-            if !input_text.is_empty() {
-                execute_parsed_vcb_input(
-                    &input_text,
+            if !text.is_empty() {
+                apply_vcb_command(
+                    &text,
                     tool_state.current,
                     &cursor_ray,
                     &selected,
                     &mut draft,
                     &mut move_state,
                     &mut scale_state,
+                    &mut offset_state,
                     &mut cad_query,
                     &mut vcb,
                     &mut pending_actions,
@@ -1136,10 +1415,9 @@ fn capture_keyboard_vcb_and_shortcuts(
             continue;
         }
 
-        // Append valid numeric / dimension characters ('0'-'9', '.', ',', '-') to VCB buffer
         if !ctrl_held {
-            if let Key::Character(ref text) = event.logical_key {
-                for ch in text.chars() {
+            if let Key::Character(ref s) = event.logical_key {
+                for ch in s.chars() {
                     if ch.is_ascii_digit() || ch == '.' || ch == ',' || ch == '-' {
                         vcb.buffer.push(ch);
                     }
@@ -1149,25 +1427,29 @@ fn capture_keyboard_vcb_and_shortcuts(
     }
 }
 
-fn cancel_in_progress_drags(
+fn abort_active_drags(
     move_state: &mut MoveToolState,
     scale_state: &mut ScaleToolState,
+    offset_state: &mut OffsetToolState,
     cad_query: &mut Query<(Entity, &CadObject, &mut Transform)>,
 ) {
     if let Some(drag) = move_state.active_drag.take() {
-        if let Ok((_, _, mut transform)) = cad_query.get_mut(drag.entity) {
-            *transform = drag.initial_transform;
+        if let Ok((_, _, mut tr)) = cad_query.get_mut(drag.entity) {
+            *tr = drag.initial_transform;
         }
     }
     if let Some(drag) = scale_state.active_drag.take() {
-        if let Ok((_, _, mut transform)) = cad_query.get_mut(drag.entity) {
-            *transform = drag.initial_transform;
+        if let Ok((_, _, mut tr)) = cad_query.get_mut(drag.entity) {
+            *tr = drag.initial_transform;
         }
     }
+    offset_state.is_dragging = false;
+    offset_state.active_contour = None;
+    offset_state.current_offset_distance = 0.0;
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_parsed_vcb_input(
+fn apply_vcb_command(
     input_text: &str,
     active_tool: CadTool,
     cursor_ray: &CursorRayState,
@@ -1175,11 +1457,12 @@ fn execute_parsed_vcb_input(
     draft: &mut ToolDraftState,
     move_state: &mut MoveToolState,
     scale_state: &mut ScaleToolState,
+    offset_state: &mut OffsetToolState,
     cad_query: &mut Query<(Entity, &CadObject, &mut Transform)>,
     vcb: &mut VcbInput,
     pending_actions: &mut PendingHistoryActions,
 ) {
-    let parts: Vec<&str> = input_text
+    let tokens: Vec<&str> = input_text
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -1192,258 +1475,180 @@ fn execute_parsed_vcb_input(
                     Some(String::from("Click a start point before entering line length"));
                 return;
             };
-
-            if parts.len() == 1 {
-                if let Ok(target_length) = parts[0].parse::<f32>() {
-                    if target_length.abs() > 0.001 {
-                        let raw_delta = draft.current_preview_end - start;
-                        let direction = if cursor_ray.vertical_z_locked {
-                            if raw_delta.z < 0.0 {
-                                -Vec3::Z
-                            } else {
-                                Vec3::Z
-                            }
+            if tokens.len() == 1 {
+                if let Ok(len) = tokens[0].parse::<f32>() {
+                    if len.abs() > 0.001 {
+                        let raw_vec = draft.current_preview_end - start;
+                        let dir = if cursor_ray.vertical_z_locked {
+                            if raw_vec.z < 0.0 { -Vec3::Z } else { Vec3::Z }
                         } else {
-                            raw_delta.try_normalize().unwrap_or(Vec3::X)
+                            raw_vec.try_normalize().unwrap_or(Vec3::X)
                         };
-
-                        let exact_end = start + direction * target_length;
-                        let line_color = cursor_ray.inference.preview_color();
-
+                        let end_pt = start + dir * len;
+                        let col = cursor_ray.inference.preview_color();
                         pending_actions.queue.push(HistoryAction::Execute(Box::new(
-                            DrawLineCommand::new(start, exact_end, line_color, None),
+                            DrawLineCommand::new(start, end_pt, col, None),
                         )));
-
-                        draft.active_start_point = Some(exact_end);
-                        draft.current_preview_end = exact_end;
-                        vcb.last_status_message =
-                            Some(format!("Committed {:.2}m line segment", target_length));
-                        return;
-                    }
-                }
-            } else if parts.len() == 3 {
-                if let (Ok(dx), Ok(dy), Ok(dz)) = (
-                    parts[0].parse::<f32>(),
-                    parts[1].parse::<f32>(),
-                    parts[2].parse::<f32>(),
-                ) {
-                    let exact_end = start + Vec3::new(dx, dy, dz);
-                    if exact_end.distance(start) > 0.001 {
-                        pending_actions.queue.push(HistoryAction::Execute(Box::new(
-                            DrawLineCommand::new(
-                                start,
-                                exact_end,
-                                DEFAULT_LINE_PREVIEW_COLOR,
-                                None,
-                            ),
-                        )));
-                        draft.active_start_point = Some(exact_end);
-                        draft.current_preview_end = exact_end;
-                        vcb.last_status_message =
-                            Some(format!("Committed offset line ({dx:.2}, {dy:.2}, {dz:.2})"));
-                        return;
+                        draft.active_start_point = Some(end_pt);
+                        draft.current_preview_end = end_pt;
+                        vcb.last_status_message = Some(format!("Committed {len:.2}m line"));
                     }
                 }
             }
-
-            vcb.last_status_message = Some(format!("Invalid Line VCB input: '{input_text}'"));
         }
         CadTool::Block => {
-            let start_corner = draft.active_start_point.unwrap_or(cursor_ray.snapped_pos);
-
-            if parts.len() == 3 {
+            let origin = draft.active_start_point.unwrap_or(cursor_ray.snapped_pos);
+            if tokens.len() == 3 {
                 if let (Ok(w), Ok(d), Ok(h)) = (
-                    parts[0].parse::<f32>(),
-                    parts[1].parse::<f32>(),
-                    parts[2].parse::<f32>(),
+                    tokens[0].parse::<f32>(),
+                    tokens[1].parse::<f32>(),
+                    tokens[2].parse::<f32>(),
                 ) {
                     if w.abs() > 0.001 && d.abs() > 0.001 && h.abs() > 0.001 {
                         let cmd = CreateBlockCommand::from_corner_and_dimensions(
-                            start_corner,
+                            origin,
                             Vec3::new(w, d, h),
                             Color::srgb(0.78, 0.82, 0.88),
                             None,
                         );
                         pending_actions.queue.push(HistoryAction::Execute(Box::new(cmd)));
                         draft.active_start_point = None;
-                        vcb.last_status_message = Some(format!(
-                            "Spawned Block ({w:.2}m x {d:.2}m x {h:.2}m)"
-                        ));
-                        return;
-                    }
-                }
-            } else if parts.len() == 1 {
-                if let Ok(h) = parts[0].parse::<f32>() {
-                    if h.abs() > 0.01 {
-                        draft.default_block_height = h;
-                        vcb.last_status_message = Some(format!("Set block height to {h:.2}m"));
-                        return;
+                        vcb.last_status_message =
+                            Some(format!("Spawned Block ({w:.2}m x {d:.2}m x {h:.2}m)"));
                     }
                 }
             }
-
-            vcb.last_status_message = Some(format!(
-                "Block VCB expects 'width,depth,height' (e.g. 3,4,2), got '{input_text}'"
-            ));
         }
         CadTool::Move => {
-            // Support exact VCB distance or (dx,dy,dz) offset during Move
-            let target_entity = move_state
+            let ent_opt = move_state
                 .active_drag
                 .as_ref()
                 .map(|d| d.entity)
                 .or_else(|| selected.entities.first().copied());
-
-            let Some(entity) = target_entity else {
-                vcb.last_status_message =
-                    Some(String::from("Select an object before entering a Move distance"));
+            let Some(entity) = ent_opt else {
                 return;
             };
-
-            let offset = if parts.len() == 1 {
-                if let Ok(dist) = parts[0].parse::<f32>() {
+            if tokens.len() == 1 {
+                if let Ok(dist) = tokens[0].parse::<f32>() {
                     let dir = move_state
                         .active_drag
                         .as_ref()
                         .and_then(|d| d.current_offset.try_normalize())
                         .unwrap_or(Vec3::X);
-                    Some(dir * dist)
-                } else {
-                    None
-                }
-            } else if parts.len() == 3 {
-                if let (Ok(dx), Ok(dy), Ok(dz)) = (
-                    parts[0].parse::<f32>(),
-                    parts[1].parse::<f32>(),
-                    parts[2].parse::<f32>(),
-                ) {
-                    Some(Vec3::new(dx, dy, dz))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            if let Some(delta) = offset {
-                let before_geom = if let Some(drag) = move_state.active_drag.take() {
-                    if let Ok((_, _, mut transform)) = cad_query.get_mut(drag.entity) {
-                        *transform = drag.initial_transform;
+                    let delta = dir * dist;
+                    let before_geom = if let Some(drag) = move_state.active_drag.take() {
+                        if let Ok((_, _, mut tr)) = cad_query.get_mut(drag.entity) {
+                            *tr = drag.initial_transform;
+                        }
+                        Some(drag.initial_geometry)
+                    } else {
+                        cad_query.get(entity).ok().map(|(_, o, _)| o.geometry.clone())
+                    };
+                    if let Some(before) = before_geom {
+                        let after = before.translated(delta);
+                        pending_actions.queue.push(HistoryAction::Execute(Box::new(
+                            MoveObjectCommand::new(entity, before, after),
+                        )));
+                        vcb.last_status_message = Some(format!("Moved object {dist:.2}m"));
                     }
-                    Some(drag.initial_geometry)
-                } else {
-                    cad_query.get(entity).ok().map(|(_, o, _)| o.geometry.clone())
-                };
-
-                if let Some(before) = before_geom {
-                    let after = before.translated(delta);
-                    pending_actions.queue.push(HistoryAction::Execute(Box::new(
-                        MoveObjectCommand::new(entity, before, after),
-                    )));
-                    vcb.last_status_message = Some(format!(
-                        "Moved object by ({:+.2}, {:+.2}, {:+.2})m",
-                        delta.x, delta.y, delta.z
-                    ));
                 }
             }
         }
         CadTool::Scale => {
-            // Typing a single scale factor (e.g. "1.5") or "sx,sy,sz" scales the object and commits `ScaleObjectCommand`
-            let scale_vec = if parts.len() == 1 {
-                parts[0]
-                    .parse::<f32>()
-                    .ok()
-                    .filter(|&s| s.abs() > 0.01)
-                    .map(Vec3::splat)
-            } else if parts.len() == 3 {
-                if let (Ok(sx), Ok(sy), Ok(sz)) = (
-                    parts[0].parse::<f32>(),
-                    parts[1].parse::<f32>(),
-                    parts[2].parse::<f32>(),
-                ) {
-                    if sx.abs() > 0.01 && sy.abs() > 0.01 && sz.abs() > 0.01 {
-                        Some(Vec3::new(sx.abs(), sy.abs(), sz.abs()))
-                    } else {
-                        None
+            if tokens.len() == 1 {
+                if let Ok(s) = tokens[0].parse::<f32>() {
+                    if s.abs() > 0.01 {
+                        let factors = Vec3::splat(s.abs());
+                        if let Some(drag) = scale_state.active_drag.take() {
+                            if let Ok((_, _, mut tr)) = cad_query.get_mut(drag.entity) {
+                                *tr = drag.initial_transform;
+                            }
+                            let after = drag
+                                .initial_geometry
+                                .scaled_from_anchor(drag.opposite_anchor, factors);
+                            pending_actions.queue.push(HistoryAction::Execute(Box::new(
+                                ScaleObjectCommand::new(drag.entity, drag.initial_geometry, after),
+                            )));
+                            vcb.last_status_message = Some(format!("Scaled object by {s:.2}x"));
+                        } else if let Some(&entity) = selected.entities.first() {
+                            if let Ok((_, obj, _)) = cad_query.get(entity) {
+                                let before = obj.geometry.clone();
+                                let (anchor, _) = before.bounds_min_max();
+                                let after = before.scaled_from_anchor(anchor, factors);
+                                pending_actions.queue.push(HistoryAction::Execute(Box::new(
+                                    ScaleObjectCommand::new(entity, before, after),
+                                )));
+                                vcb.last_status_message = Some(format!("Scaled object by {s:.2}x"));
+                            }
+                        }
                     }
-                } else {
-                    None
                 }
-            } else {
-                None
-            };
+            }
+        }
+        CadTool::Offset => {
+            // VCB decimal offset distance (e.g. "0.3" or "-0.3")
+            if tokens.len() == 1 {
+                if let Ok(typed_dist) = tokens[0].parse::<f32>() {
+                    if typed_dist.abs() > 0.001 {
+                        let target_contour = offset_state
+                            .active_contour
+                            .take()
+                            .or_else(|| offset_state.hovered_contour.clone())
+                            .or_else(|| {
+                                selected.entities.first().and_then(|&ent| {
+                                    detect_offset_contour_for_entity(ent, cad_query, selected)
+                                })
+                            });
 
-            let Some(factors) = scale_vec else {
-                vcb.last_status_message = Some(format!(
-                    "Invalid Scale factor '{input_text}' (try e.g. 1.5 or 1.5,1.5,2.0)"
-                ));
-                return;
-            };
+                        offset_state.is_dragging = false;
 
-            if let Some(drag) = scale_state.active_drag.take() {
-                if let Ok((_, _, mut transform)) = cad_query.get_mut(drag.entity) {
-                    *transform = drag.initial_transform;
+                        if let Some(contour) = target_contour {
+                            // If dragging inward when a positive number is typed, preserve drag direction sign
+                            let direction_sign = if typed_dist < 0.0 {
+                                1.0
+                            } else if offset_state.current_offset_distance < -0.001 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            let final_dist = typed_dist * direction_sign;
+                            let segs = contour.compute_offset_segments(final_dist);
+                            if !segs.is_empty() {
+                                pending_actions.queue.push(HistoryAction::Execute(Box::new(
+                                    CreateOffsetCommand::new(
+                                        segs,
+                                        OFFSET_PREVIEW_COLOR,
+                                        contour.group_id,
+                                    ),
+                                )));
+                                vcb.last_status_message = Some(format!(
+                                    "Committed concentric offset at {final_dist:+.2}m"
+                                ));
+                            }
+                        } else {
+                            vcb.last_status_message = Some(String::from(
+                                "Hover or select a face/line chain before entering offset distance",
+                            ));
+                        }
+                    }
                 }
-                let after = drag
-                    .initial_geometry
-                    .scaled_from_anchor(drag.opposite_anchor, factors);
-                pending_actions.queue.push(HistoryAction::Execute(Box::new(
-                    ScaleObjectCommand::new(drag.entity, drag.initial_geometry, after),
-                )));
-                vcb.last_status_message = Some(format!(
-                    "Scaled object by ({:.2}, {:.2}, {:.2})",
-                    factors.x, factors.y, factors.z
-                ));
-            } else if let Some(&entity) = selected.entities.first() {
-                if let Ok((_, cad_obj, _)) = cad_query.get(entity) {
-                    let before = cad_obj.geometry.clone();
-                    let (min_anchor, _) = before.aabb_min_max();
-                    let after = before.scaled_from_anchor(min_anchor, factors);
-                    pending_actions.queue.push(HistoryAction::Execute(Box::new(
-                        ScaleObjectCommand::new(entity, before, after),
-                    )));
-                    vcb.last_status_message = Some(format!(
-                        "Scaled selected object by ({:.2}, {:.2}, {:.2})",
-                        factors.x, factors.y, factors.z
-                    ));
-                }
-            } else {
-                vcb.last_status_message =
-                    Some(String::from("Select an object first to apply VCB Scale"));
             }
         }
         CadTool::PushPullExtrude => {
-            if parts.len() == 1 {
-                if let Ok(h) = parts[0].parse::<f32>() {
+            if tokens.len() == 1 {
+                if let Ok(h) = tokens[0].parse::<f32>() {
                     if h.abs() > 0.01 {
                         draft.default_block_height = h;
-                        let base = cursor_ray.snapped_pos - Vec3::new(0.6, 0.6, 0.0);
-                        let cmd = CreateBlockCommand::from_corner_and_dimensions(
-                            base,
-                            Vec3::new(1.2, 1.2, h),
-                            Color::srgb(0.82, 0.85, 0.90),
-                            None,
-                        );
-                        pending_actions.queue.push(HistoryAction::Execute(Box::new(cmd)));
-                        vcb.last_status_message =
-                            Some(format!("Extruded column of height {h:.2}m"));
                     }
                 }
             }
         }
-        CadTool::Select => {
-            vcb.last_status_message =
-                Some(String::from("Switch to Line, Block, Move, or Scale to use VCB"));
-        }
+        CadTool::Select => {}
     }
 }
 
-// ============================================================================
-// VIEWPORT INTERACTIONS (SELECT, LINE, BLOCK, MOVE DRAG, SCALE 8-HANDLE DRAG)
-// ============================================================================
-
 #[allow(clippy::too_many_arguments)]
-fn handle_viewport_tool_interactions(
+fn process_viewport_pointer_actions(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     keyboard: Res<ButtonInput<KeyCode>>,
     ui_capture: Res<UiInputCapture>,
@@ -1455,6 +1660,7 @@ fn handle_viewport_tool_interactions(
     mut draft: ResMut<ToolDraftState>,
     mut move_state: ResMut<MoveToolState>,
     mut scale_state: ResMut<ScaleToolState>,
+    mut offset_state: ResMut<OffsetToolState>,
     mut selected: ResMut<SelectedCadObjects>,
     mut vcb: ResMut<VcbInput>,
     mut pending_actions: ResMut<PendingHistoryActions>,
@@ -1462,48 +1668,115 @@ fn handle_viewport_tool_interactions(
     let Ok(window) = window_query.get_single() else {
         return;
     };
-    let Ok((camera, camera_transform)) = camera_query.get_single() else {
+    let Ok((camera, cam_transform)) = camera_query.get_single() else {
         return;
     };
     let current_ray = window
         .cursor_position()
-        .and_then(|pos| camera.viewport_to_world(camera_transform, pos));
+        .and_then(|pos| camera.viewport_to_world(cam_transform, pos));
 
     match tool_state.current {
         // --------------------------------------------------------------------
-        // MOVE TOOL (Click LMB on object -> Drag in 3D with R/G/B/Z/Magenta snap -> Release commits MoveObjectCommand)
+        // OFFSET TOOL (`[F]`): Hover highlights perimeter -> LMB Drag offsets inward/outward -> Release commits `CreateOffsetCommand`
         // --------------------------------------------------------------------
+        CadTool::Offset => {
+            if offset_state.is_dragging {
+                if let Some(ref contour) = offset_state.active_contour {
+                    if let Some(ref ray) = current_ray {
+                        let plane_pt = Vec3::new(0.0, 0.0, contour.plane_z);
+                        if let Some(d) =
+                            ray.intersect_plane(plane_pt, InfinitePlane3d::new(Vec3::Z))
+                        {
+                            let hit = ray.get_point(d);
+                            let curr_r = Vec2::new(
+                                hit.x - contour.center.x,
+                                hit.y - contour.center.y,
+                            )
+                            .length();
+                            let raw_offset = curr_r - offset_state.grab_radius;
+                            // Snap to 0.05m increments during interactive drag
+                            offset_state.current_offset_distance =
+                                (raw_offset / 0.05_f32).round() * 0.05_f32;
+                        }
+                    }
+                }
+
+                if mouse_buttons.just_released(MouseButton::Left) {
+                    offset_state.is_dragging = false;
+                    let dist = offset_state.current_offset_distance;
+                    if let Some(contour) = offset_state.active_contour.take() {
+                        if dist.abs() > 0.02 {
+                            let segs = contour.compute_offset_segments(dist);
+                            if !segs.is_empty() {
+                                pending_actions.queue.push(HistoryAction::Execute(Box::new(
+                                    CreateOffsetCommand::new(
+                                        segs,
+                                        OFFSET_PREVIEW_COLOR,
+                                        contour.group_id,
+                                    ),
+                                )));
+                                vcb.last_status_message =
+                                    Some(format!("Created offset contour ({dist:+.2}m)"));
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
+            // Update hovered perimeter contour when not actively dragging
+            offset_state.hovered_contour = None;
+            if let Some(ref ray) = current_ray {
+                if let Some((hit_ent, _)) = find_closest_cad_object(ray, &cad_query) {
+                    offset_state.hovered_contour =
+                        detect_offset_contour_for_entity(hit_ent, &cad_query, &selected);
+                } else if let Some(&sel_ent) = selected.entities.first() {
+                    offset_state.hovered_contour =
+                        detect_offset_contour_for_entity(sel_ent, &cad_query, &selected);
+                }
+
+                if !ui_capture.egui_wants_pointer && mouse_buttons.just_pressed(MouseButton::Left) {
+                    if let Some(contour) = offset_state.hovered_contour.clone() {
+                        let plane_pt = Vec3::new(0.0, 0.0, contour.plane_z);
+                        let grab_r = ray
+                            .intersect_plane(plane_pt, InfinitePlane3d::new(Vec3::Z))
+                            .map(|d| {
+                                let p = ray.get_point(d);
+                                Vec2::new(p.x - contour.center.x, p.y - contour.center.y).length()
+                            })
+                            .unwrap_or(1.0);
+
+                        offset_state.grab_radius = grab_r;
+                        offset_state.current_offset_distance = 0.0;
+                        offset_state.active_contour = Some(contour);
+                        offset_state.is_dragging = true;
+                    }
+                }
+            }
+        }
+
         CadTool::Move => {
             if let Some(ref mut drag) = move_state.active_drag {
                 if cursor_ray.is_valid_hit {
                     let offset = draft.current_preview_end - drag.grab_anchor;
                     drag.current_offset = offset;
-                    if let Ok((_, _, mut transform)) = cad_query.get_mut(drag.entity) {
-                        transform.translation = drag.initial_transform.translation + offset;
+                    if let Ok((_, _, mut tr)) = cad_query.get_mut(drag.entity) {
+                        tr.translation = drag.initial_transform.translation + offset;
                     }
                 }
 
                 if mouse_buttons.just_released(MouseButton::Left) {
-                    if let Some(finished_drag) = move_state.active_drag.take() {
-                        // Restore transform before executing command through CommandHistory
-                        if let Ok((_, _, mut transform)) = cad_query.get_mut(finished_drag.entity) {
-                            *transform = finished_drag.initial_transform;
+                    if let Some(done) = move_state.active_drag.take() {
+                        if let Ok((_, _, mut tr)) = cad_query.get_mut(done.entity) {
+                            *tr = done.initial_transform;
                         }
-                        if finished_drag.current_offset.length() > 0.01 {
-                            let after = finished_drag
-                                .initial_geometry
-                                .translated(finished_drag.current_offset);
+                        if done.current_offset.length() > 0.01 {
+                            let after = done.initial_geometry.translated(done.current_offset);
                             pending_actions.queue.push(HistoryAction::Execute(Box::new(
-                                MoveObjectCommand::new(
-                                    finished_drag.entity,
-                                    finished_drag.initial_geometry,
-                                    after,
-                                ),
+                                MoveObjectCommand::new(done.entity, done.initial_geometry, after),
                             )));
-                            vcb.last_status_message = Some(format!(
-                                "Moved object {:.2}m",
-                                finished_drag.current_offset.length()
-                            ));
+                            vcb.last_status_message =
+                                Some(format!("Moved object {:.2}m", done.current_offset.length()));
                         }
                     }
                 }
@@ -1514,122 +1787,96 @@ fn handle_viewport_tool_interactions(
                 let Some(ray) = current_ray else {
                     return;
                 };
-                if let Some((hit_entity, _)) = pick_closest_cad_object(&ray, &cad_query) {
+                if let Some((hit_ent, _)) = find_closest_cad_object(&ray, &cad_query) {
                     selected.entities.clear();
-                    selected.entities.push(hit_entity);
-
-                    if let Ok((_, cad_obj, transform)) = cad_query.get(hit_entity) {
-                        let grab_anchor = if cursor_ray.is_valid_hit {
-                            Vec3::new(
-                                cursor_ray.snapped_pos.x,
-                                cursor_ray.snapped_pos.y,
-                                cad_obj.geometry.center().z,
-                            )
-                        } else {
-                            cad_obj.geometry.center()
-                        };
-
+                    selected.entities.push(hit_ent);
+                    if let Ok((_, obj, tr)) = cad_query.get(hit_ent) {
+                        let anchor = snap_to_integer_grid(obj.geometry.centroid());
                         move_state.active_drag = Some(ActiveMoveDrag {
-                            entity: hit_entity,
-                            grab_anchor,
+                            entity: hit_ent,
+                            grab_anchor: anchor,
                             current_offset: Vec3::ZERO,
-                            initial_geometry: cad_obj.geometry.clone(),
-                            initial_transform: *transform,
+                            initial_geometry: obj.geometry.clone(),
+                            initial_transform: *tr,
                         });
                     }
                 }
             }
         }
 
-        // --------------------------------------------------------------------
-        // SCALE TOOL (8 Clickable Bounding-Box Control Handles + VCB Factor Support)
-        // --------------------------------------------------------------------
         CadTool::Scale => {
             scale_state.hovered_handle = None;
 
             if let Some(ref mut drag) = scale_state.active_drag {
                 if cursor_ray.is_valid_hit {
-                    let initial_vec = drag.initial_handle_pos - drag.opposite_anchor;
-                    let current_vec = draft.current_preview_end - drag.opposite_anchor;
-
-                    let compute_factor = |init_c: f32, curr_c: f32| -> f32 {
-                        if init_c.abs() > 0.08 {
-                            (curr_c / init_c).abs().clamp(0.10, 20.0)
+                    let init_v = drag.initial_handle_pos - drag.opposite_anchor;
+                    let curr_v = draft.current_preview_end - drag.opposite_anchor;
+                    let axis_ratio = |i_c: f32, c_c: f32| -> f32 {
+                        if i_c.abs() > 0.08 {
+                            let snapped = (c_c / GRID_SNAP_STEP).round() * GRID_SNAP_STEP;
+                            let num = if snapped.abs() >= 0.5 { snapped } else { c_c };
+                            (num / i_c).abs().clamp(0.10, 20.0)
                         } else {
                             1.0
                         }
                     };
-
                     let factors = Vec3::new(
-                        compute_factor(initial_vec.x, current_vec.x),
-                        compute_factor(initial_vec.y, current_vec.y),
-                        compute_factor(initial_vec.z, current_vec.z),
+                        axis_ratio(init_v.x, curr_v.x),
+                        axis_ratio(init_v.y, curr_v.y),
+                        axis_ratio(init_v.z, curr_v.z),
                     );
                     drag.current_scale_factors = factors;
 
-                    // Live visual scale preview on the entity's Transform
-                    let preview_geom = drag
+                    let preview = drag
                         .initial_geometry
                         .scaled_from_anchor(drag.opposite_anchor, factors);
-                    if let Ok((_, _, mut transform)) = cad_query.get_mut(drag.entity) {
-                        transform.translation = preview_geom.center();
-                        transform.scale = factors;
+                    if let Ok((_, _, mut tr)) = cad_query.get_mut(drag.entity) {
+                        tr.translation = preview.centroid();
+                        tr.scale = factors;
                     }
                 }
 
                 if mouse_buttons.just_released(MouseButton::Left) {
-                    if let Some(finished_drag) = scale_state.active_drag.take() {
-                        if let Ok((_, _, mut transform)) = cad_query.get_mut(finished_drag.entity) {
-                            *transform = finished_drag.initial_transform;
+                    if let Some(done) = scale_state.active_drag.take() {
+                        if let Ok((_, _, mut tr)) = cad_query.get_mut(done.entity) {
+                            *tr = done.initial_transform;
                         }
-                        if (finished_drag.current_scale_factors - Vec3::ONE).length() > 0.01 {
-                            let after = finished_drag.initial_geometry.scaled_from_anchor(
-                                finished_drag.opposite_anchor,
-                                finished_drag.current_scale_factors,
+                        if (done.current_scale_factors - Vec3::ONE).length() > 0.01 {
+                            let after = done.initial_geometry.scaled_from_anchor(
+                                done.opposite_anchor,
+                                done.current_scale_factors,
                             );
                             pending_actions.queue.push(HistoryAction::Execute(Box::new(
-                                ScaleObjectCommand::new(
-                                    finished_drag.entity,
-                                    finished_drag.initial_geometry,
-                                    after,
-                                ),
+                                ScaleObjectCommand::new(done.entity, done.initial_geometry, after),
                             )));
-                            vcb.last_status_message = Some(format!(
-                                "Scaled object by ({:.2}, {:.2}, {:.2})",
-                                finished_drag.current_scale_factors.x,
-                                finished_drag.current_scale_factors.y,
-                                finished_drag.current_scale_factors.z
-                            ));
                         }
                     }
                 }
                 return;
             }
 
-            // Detect hover or click on the 8 bounding-box vertex handles of the selected object
             let Some(ray) = current_ray else {
                 return;
             };
 
-            if let Some(&sel_entity) = selected.entities.first() {
-                if let Ok((_, cad_obj, transform)) = cad_query.get(sel_entity) {
-                    let corners = cad_obj.geometry.corners_8();
-                    let handle_hit = pick_closest_scale_handle(&ray, &corners);
-                    scale_state.hovered_handle = handle_hit;
+            if let Some(&sel_ent) = selected.entities.first() {
+                if let Ok((_, obj, tr)) = cad_query.get(sel_ent) {
+                    let corners = obj.geometry.bbox_vertices();
+                    let hit_h = pick_bbox_handle(&ray, &corners);
+                    scale_state.hovered_handle = hit_h;
 
                     if !ui_capture.egui_wants_pointer
                         && mouse_buttons.just_pressed(MouseButton::Left)
                     {
-                        if let Some(h_idx) = handle_hit {
-                            let opposite_idx = 7 - h_idx;
+                        if let Some(h_idx) = hit_h {
                             scale_state.active_drag = Some(ActiveScaleDrag {
-                                entity: sel_entity,
+                                entity: sel_ent,
                                 handle_index: h_idx,
-                                opposite_anchor: corners[opposite_idx],
+                                opposite_anchor: corners[7 - h_idx],
                                 initial_handle_pos: corners[h_idx],
                                 current_scale_factors: Vec3::ONE,
-                                initial_geometry: cad_obj.geometry.clone(),
-                                initial_transform: *transform,
+                                initial_geometry: obj.geometry.clone(),
+                                initial_transform: *tr,
                             });
                             return;
                         }
@@ -1637,18 +1884,14 @@ fn handle_viewport_tool_interactions(
                 }
             }
 
-            // If clicking LMB on another object while in Scale mode, select that object
             if !ui_capture.egui_wants_pointer && mouse_buttons.just_pressed(MouseButton::Left) {
-                if let Some((hit_entity, _)) = pick_closest_cad_object(&ray, &cad_query) {
+                if let Some((hit_ent, _)) = find_closest_cad_object(&ray, &cad_query) {
                     selected.entities.clear();
-                    selected.entities.push(hit_entity);
+                    selected.entities.push(hit_ent);
                 }
             }
         }
 
-        // --------------------------------------------------------------------
-        // SELECT TOOL
-        // --------------------------------------------------------------------
         CadTool::Select => {
             if ui_capture.egui_wants_pointer || !mouse_buttons.just_pressed(MouseButton::Left) {
                 return;
@@ -1657,22 +1900,17 @@ fn handle_viewport_tool_interactions(
             let Some(ray) = current_ray else {
                 return;
             };
-
-            let closest_hit = pick_closest_cad_object(&ray, &cad_query);
-            let shift_held = keyboard.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
-            if !shift_held {
+            let hit = find_closest_cad_object(&ray, &cad_query);
+            if !keyboard.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]) {
                 selected.entities.clear();
             }
-            if let Some((hit_entity, _)) = closest_hit {
-                if !selected.entities.contains(&hit_entity) {
-                    selected.entities.push(hit_entity);
+            if let Some((ent, _)) = hit {
+                if !selected.entities.contains(&ent) {
+                    selected.entities.push(ent);
                 }
             }
         }
 
-        // --------------------------------------------------------------------
-        // LINE DRAW TOOL (Continuous Polyline Chain)
-        // --------------------------------------------------------------------
         CadTool::LineDraw => {
             if ui_capture.egui_wants_pointer
                 || !mouse_buttons.just_pressed(MouseButton::Left)
@@ -1680,25 +1918,20 @@ fn handle_viewport_tool_interactions(
             {
                 return;
             }
-            let target_point = draft.current_preview_end;
-
-            if let Some(start_point) = draft.active_start_point {
-                if start_point.distance(target_point) > 0.02 {
-                    let color = cursor_ray.inference.preview_color();
-                    let cmd = DrawLineCommand::new(start_point, target_point, color, None);
-                    pending_actions.queue.push(HistoryAction::Execute(Box::new(cmd)));
-
-                    // Continuous Line Chain: end point becomes the start point of the next line
-                    draft.active_start_point = Some(target_point);
+            let target = draft.current_preview_end;
+            if let Some(start) = draft.active_start_point {
+                if start.distance(target) > 0.05 {
+                    let col = cursor_ray.inference.preview_color();
+                    pending_actions.queue.push(HistoryAction::Execute(Box::new(
+                        DrawLineCommand::new(start, target, col, None),
+                    )));
+                    draft.active_start_point = Some(target);
                 }
             } else {
-                draft.active_start_point = Some(target_point);
+                draft.active_start_point = Some(target);
             }
         }
 
-        // --------------------------------------------------------------------
-        // 3D BLOCK (BOX) TOOL
-        // --------------------------------------------------------------------
         CadTool::Block => {
             if ui_capture.egui_wants_pointer
                 || !mouse_buttons.just_pressed(MouseButton::Left)
@@ -1706,29 +1939,34 @@ fn handle_viewport_tool_interactions(
             {
                 return;
             }
-            let target_point = draft.current_preview_end;
-
-            if let Some(start_corner) = draft.active_start_point.take() {
-                let end_corner = Vec3::new(
-                    target_point.x,
-                    target_point.y,
-                    start_corner.z + draft.default_block_height,
-                );
-                let cmd = CreateBlockCommand::from_corners(
-                    start_corner,
-                    end_corner,
-                    Color::srgb(0.78, 0.82, 0.88),
-                    None,
-                );
-                pending_actions.queue.push(HistoryAction::Execute(Box::new(cmd)));
+            let target = draft.current_preview_end;
+            if let Some(c0) = draft.active_start_point.take() {
+                let dx = target.x - c0.x;
+                let dy = target.y - c0.y;
+                let ex = if dx.abs() < GRID_SNAP_STEP {
+                    c0.x + dx.signum().max(1.0) * GRID_SNAP_STEP
+                } else {
+                    target.x
+                };
+                let ey = if dy.abs() < GRID_SNAP_STEP {
+                    c0.y + dy.signum().max(1.0) * GRID_SNAP_STEP
+                } else {
+                    target.y
+                };
+                let c1 = Vec3::new(ex, ey, c0.z + draft.default_block_height);
+                pending_actions.queue.push(HistoryAction::Execute(Box::new(
+                    CreateBlockCommand::from_corners(
+                        c0,
+                        c1,
+                        Color::srgb(0.78, 0.82, 0.88),
+                        None,
+                    ),
+                )));
             } else {
-                draft.active_start_point = Some(target_point);
+                draft.active_start_point = Some(target);
             }
         }
 
-        // --------------------------------------------------------------------
-        // PUSH/PULL EXTRUDE TOOL
-        // --------------------------------------------------------------------
         CadTool::PushPullExtrude => {
             if ui_capture.egui_wants_pointer
                 || !mouse_buttons.just_pressed(MouseButton::Left)
@@ -1736,129 +1974,112 @@ fn handle_viewport_tool_interactions(
             {
                 return;
             }
-            let target_point = draft.current_preview_end;
+            let target = draft.current_preview_end;
             draft.active_start_point = None;
-            let corner = Vec3::new(target_point.x - 0.6, target_point.y - 0.6, target_point.z);
-            let cmd = CreateBlockCommand::from_corner_and_dimensions(
-                corner,
-                Vec3::new(1.2, 1.2, draft.default_block_height),
-                Color::srgb(0.82, 0.85, 0.90),
-                None,
-            );
-            pending_actions.queue.push(HistoryAction::Execute(Box::new(cmd)));
+            pending_actions.queue.push(HistoryAction::Execute(Box::new(
+                CreateBlockCommand::from_corner_and_dimensions(
+                    target,
+                    Vec3::new(1.0, 1.0, draft.default_block_height),
+                    Color::srgb(0.82, 0.85, 0.90),
+                    None,
+                ),
+            )));
         }
     }
 }
 
-fn pick_closest_cad_object(
+fn find_closest_cad_object(
     ray: &Ray3d,
     cad_query: &Query<(Entity, &CadObject, &mut Transform)>,
 ) -> Option<(Entity, f32)> {
-    let mut closest_hit: Option<(Entity, f32)> = None;
-    for (entity, cad_obj, _) in cad_query.iter() {
-        if let Some(hit_dist) = ray_hits_cad_object(ray, cad_obj) {
-            let is_closer = closest_hit
-                .map(|(_, best_d)| hit_dist < best_d)
-                .unwrap_or(true);
-            if is_closer {
-                closest_hit = Some((entity, hit_dist));
+    let mut best: Option<(Entity, f32)> = None;
+    for (ent, obj, _) in cad_query.iter() {
+        if let Some(d) = ray_intersects_cad_object(ray, obj) {
+            if best.map(|(_, b)| d < b).unwrap_or(true) {
+                best = Some((ent, d));
             }
         }
     }
-    closest_hit
+    best
 }
 
-fn pick_closest_scale_handle(ray: &Ray3d, corners: &[Vec3; 8]) -> Option<usize> {
-    let ray_origin = ray.origin;
-    let ray_dir = Vec3::from(ray.direction);
-    let mut best_handle: Option<(usize, f32)> = None;
-    let pick_radius = 0.22_f32;
+fn pick_bbox_handle(ray: &Ray3d, corners: &[Vec3; 8]) -> Option<usize> {
+    let origin = ray.origin;
+    let dir = Vec3::from(ray.direction);
+    let mut best: Option<(usize, f32)> = None;
 
-    for (idx, &corner) in corners.iter().enumerate() {
-        let to_corner = corner - ray_origin;
-        let t = to_corner.dot(ray_dir).max(0.0);
-        let closest_pt = ray_origin + ray_dir * t;
-        let dist = closest_pt.distance(corner);
-        if dist <= pick_radius {
-            let is_closer = best_handle.map(|(_, best_t)| t < best_t).unwrap_or(true);
-            if is_closer {
-                best_handle = Some((idx, t));
-            }
+    for (idx, &pt) in corners.iter().enumerate() {
+        let t = (pt - origin).dot(dir).max(0.0);
+        let closest = origin + dir * t;
+        if closest.distance(pt) <= 0.24 && best.map(|(_, bt)| t < bt).unwrap_or(true) {
+            best = Some((idx, t));
         }
     }
-
-    best_handle.map(|(idx, _)| idx)
+    best.map(|(i, _)| i)
 }
 
-fn ray_hits_cad_object(ray: &Ray3d, cad_obj: &CadObject) -> Option<f32> {
-    let ray_origin = ray.origin;
-    let ray_dir = Vec3::from(ray.direction);
+fn ray_intersects_cad_object(ray: &Ray3d, obj: &CadObject) -> Option<f32> {
+    let ro = ray.origin;
+    let rd = Vec3::from(ray.direction);
 
-    match cad_obj.geometry {
+    match obj.geometry {
         CadGeometryKind::Block { center, size } => {
             let half = size * 0.5;
-            let min_pt = center - half;
-            let max_pt = center + half;
-
-            let mut t_min = f32::NEG_INFINITY;
-            let mut t_max = f32::INFINITY;
+            let b_min = center - half;
+            let b_max = center + half;
+            let mut t_near = f32::NEG_INFINITY;
+            let mut t_far = f32::INFINITY;
 
             for axis in 0..3 {
-                let origin_a = ray_origin[axis];
-                let dir_a = ray_dir[axis];
-                let min_a = min_pt[axis];
-                let max_a = max_pt[axis];
-
-                if dir_a.abs() < 1e-6 {
-                    if origin_a < min_a || origin_a > max_a {
+                let o = ro[axis];
+                let d = rd[axis];
+                if d.abs() < 1e-6 {
+                    if o < b_min[axis] || o > b_max[axis] {
                         return None;
                     }
                 } else {
-                    let inv_d = 1.0 / dir_a;
-                    let mut t1 = (min_a - origin_a) * inv_d;
-                    let mut t2 = (max_a - origin_a) * inv_d;
+                    let inv = 1.0 / d;
+                    let mut t1 = (b_min[axis] - o) * inv;
+                    let mut t2 = (b_max[axis] - o) * inv;
                     if t1 > t2 {
                         std::mem::swap(&mut t1, &mut t2);
                     }
-                    t_min = t_min.max(t1);
-                    t_max = t_max.min(t2);
-                    if t_min > t_max {
+                    t_near = t_near.max(t1);
+                    t_far = t_far.min(t2);
+                    if t_near > t_far {
                         return None;
                     }
                 }
             }
-
-            if t_max >= 0.0 {
-                Some(t_min.max(0.0))
+            if t_far >= 0.0 {
+                Some(t_near.max(0.0))
             } else {
                 None
             }
         }
         CadGeometryKind::Line { start, end, radius } => {
             let u = end - start;
-            let v = ray_dir;
-            let w = start - ray_origin;
+            let w = start - ro;
             let a = u.dot(u);
-            let b = u.dot(v);
-            let c = v.dot(v);
+            let b = u.dot(rd);
+            let c = rd.dot(rd);
             let d = u.dot(w);
-            let e = v.dot(w);
+            let e = rd.dot(w);
             let denom = a * c - b * b;
 
-            let (s_clamped, t_ray) = if denom.abs() < 1e-6 {
+            let (s, t) = if denom.abs() < 1e-6 {
                 (0.0_f32, (e / c).max(0.0))
             } else {
-                let s = ((b * e - c * d) / denom).clamp(0.0, 1.0);
-                let t = ((a * e - b * d) / denom).max(0.0);
-                (s, t)
+                (
+                    ((b * e - c * d) / denom).clamp(0.0, 1.0),
+                    ((a * e - b * d) / denom).max(0.0),
+                )
             };
 
-            let point_on_seg = start + u * s_clamped;
-            let point_on_ray = ray_origin + v * t_ray;
-            let pick_tolerance = (radius * 4.5).max(0.14);
-
-            if point_on_seg.distance(point_on_ray) <= pick_tolerance {
-                Some(t_ray)
+            let seg_pt = start + u * s;
+            let ray_pt = ro + rd * t;
+            if seg_pt.distance(ray_pt) <= (radius * 4.5).max(0.14) {
+                Some(t)
             } else {
                 None
             }
@@ -1866,95 +2087,85 @@ fn ray_hits_cad_object(ray: &Ray3d, cad_obj: &CadObject) -> Option<f32> {
     }
 }
 
-fn sync_selection_highlighting(
+fn refresh_selection_materials(
     selected: Res<SelectedCadObjects>,
     cad_objects: Query<(Entity, &CadObject, &Handle<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    for (entity, cad_obj, mat_handle) in cad_objects.iter() {
-        let Some(material) = materials.get_mut(mat_handle) else {
+    for (ent, obj, mat_h) in cad_objects.iter() {
+        let Some(mat) = materials.get_mut(mat_h) else {
             continue;
         };
-
-        if selected.entities.contains(&entity) {
-            material.base_color = NEON_BLUE_SELECTION_COLOR;
-            material.emissive = LinearRgba::rgb(0.02, 0.45, 0.65);
+        if selected.entities.contains(&ent) {
+            mat.base_color = NEON_BLUE_SELECTION_COLOR;
+            mat.emissive = LinearRgba::rgb(0.02, 0.45, 0.65);
         } else {
-            material.base_color = cad_obj.material_color.0;
-            material.emissive = LinearRgba::BLACK;
+            mat.base_color = obj.material_color.0;
+            mat.emissive = LinearRgba::BLACK;
         }
     }
 }
 
-fn update_transparent_block_preview(
+fn sync_block_preview_mesh(
     tool_state: Res<ActiveToolState>,
     draft: Res<ToolDraftState>,
     cursor_ray: Res<CursorRayState>,
-    mut preview_query: Query<(&mut Transform, &mut Visibility), With<BlockPreviewVisual>>,
+    mut preview_q: Query<(&mut Transform, &mut Visibility), With<BlockPreviewVisual>>,
 ) {
-    let Ok((mut transform, mut visibility)) = preview_query.get_single_mut() else {
+    let Ok((mut tr, mut vis)) = preview_q.get_single_mut() else {
         return;
     };
 
     if tool_state.current == CadTool::Block && cursor_ray.is_valid_hit {
-        if let Some(start_corner) = draft.active_start_point {
-            let end_corner = Vec3::new(
-                draft.current_preview_end.x,
-                draft.current_preview_end.y,
-                start_corner.z + draft.default_block_height,
-            );
-            let min_pt = start_corner.min(end_corner);
-            let max_pt = start_corner.max(end_corner);
-            let size = Vec3::new(
-                (max_pt.x - min_pt.x).max(0.05),
-                (max_pt.y - min_pt.y).max(0.05),
-                (max_pt.z - min_pt.z).max(0.05),
-            );
-            let center = (min_pt + max_pt) * 0.5;
-
-            transform.translation = center;
-            transform.rotation = Quat::IDENTITY;
-            transform.scale = size;
-            *visibility = Visibility::Visible;
+        if let Some(c0) = draft.active_start_point {
+            let dx = draft.current_preview_end.x - c0.x;
+            let dy = draft.current_preview_end.y - c0.y;
+            let ex = if dx.abs() < GRID_SNAP_STEP {
+                c0.x + dx.signum().max(1.0) * GRID_SNAP_STEP
+            } else {
+                draft.current_preview_end.x
+            };
+            let ey = if dy.abs() < GRID_SNAP_STEP {
+                c0.y + dy.signum().max(1.0) * GRID_SNAP_STEP
+            } else {
+                draft.current_preview_end.y
+            };
+            let c1 = Vec3::new(ex, ey, c0.z + draft.default_block_height);
+            let lo = c0.min(c1);
+            let hi = c0.max(c1);
+            tr.translation = (lo + hi) * 0.5;
+            tr.scale = (hi - lo).max(Vec3::new(GRID_SNAP_STEP, GRID_SNAP_STEP, 0.10));
+            *vis = Visibility::Visible;
             return;
         }
     }
-
-    *visibility = Visibility::Hidden;
+    *vis = Visibility::Hidden;
 }
 
-// ============================================================================
-// GIZMO RENDERING: INFINITE GRID, DASHED MAGENTA GUIDES & 8 SCALE HANDLES
-// ============================================================================
-
-/// Helper that renders a 3D dashed line between `start` and `end` using `Gizmos`.
-fn draw_dashed_gizmo_line(
+fn render_dashed_segment(
     gizmos: &mut Gizmos,
-    start: Vec3,
-    end: Vec3,
-    dash_length: f32,
-    gap_length: f32,
-    color: Color,
+    a: Vec3,
+    b: Vec3,
+    dash: f32,
+    gap: f32,
+    col: Color,
 ) {
-    let delta = end - start;
-    let total_len = delta.length();
-    if total_len <= 0.001 {
+    let vec = b - a;
+    let total = vec.length();
+    if total <= 0.001 {
         return;
     }
-    let dir = delta / total_len;
-    let step = (dash_length + gap_length).max(0.05);
-    let mut dist = 0.0_f32;
-
-    while dist < total_len {
-        let seg_start = start + dir * dist;
-        let seg_end = start + dir * (dist + dash_length).min(total_len);
-        gizmos.line(seg_start, seg_end, color);
-        dist += step;
+    let dir = vec / total;
+    let step = (dash + gap).max(0.05);
+    let mut pos = 0.0_f32;
+    while pos < total {
+        gizmos.line(a + dir * pos, a + dir * (pos + dash).min(total), col);
+        pos += step;
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_infinite_grid_and_tool_gizmos(
+fn draw_viewport_gizmos(
     mut gizmos: Gizmos,
     focal_point: Res<FocalPoint>,
     tool_state: Res<ActiveToolState>,
@@ -1962,52 +2173,41 @@ fn render_infinite_grid_and_tool_gizmos(
     draft: Res<ToolDraftState>,
     move_state: Res<MoveToolState>,
     scale_state: Res<ScaleToolState>,
+    offset_state: Res<OffsetToolState>,
     selected: Res<SelectedCadObjects>,
     cad_objects: Query<&CadObject>,
 ) {
-    // 1. Camera-following outer infinite X/Y ground grid centered around `FocalPoint`
     let step = 5.0_f32;
     let half_span = 25_i32;
-    let center_x = (focal_point.0.x / step).round() * step;
-    let center_y = (focal_point.0.y / step).round() * step;
-    let max_dist = half_span as f32 * step;
-    let outer_grid_color = Color::srgba(0.38, 0.42, 0.48, 0.26);
+    let cx = (focal_point.0.x / step).round() * step;
+    let cy = (focal_point.0.y / step).round() * step;
+    let max_d = half_span as f32 * step;
+    let g_col = Color::srgba(0.38, 0.42, 0.48, 0.26);
 
     for i in -half_span..=half_span {
-        let offset = i as f32 * step;
-        let x = center_x + offset;
-        let y = center_y + offset;
-
+        let off = i as f32 * step;
+        let x = cx + off;
+        let y = cy + off;
         if y.abs() > 0.01 {
-            gizmos.line(
-                Vec3::new(center_x - max_dist, y, -0.002),
-                Vec3::new(center_x + max_dist, y, -0.002),
-                outer_grid_color,
-            );
+            gizmos.line(Vec3::new(cx - max_d, y, -0.002), Vec3::new(cx + max_d, y, -0.002), g_col);
         }
         if x.abs() > 0.01 {
-            gizmos.line(
-                Vec3::new(x, center_y - max_dist, -0.002),
-                Vec3::new(x, center_y + max_dist, -0.002),
-                outer_grid_color,
-            );
+            gizmos.line(Vec3::new(x, cy - max_d, -0.002), Vec3::new(x, cy + max_d, -0.002), g_col);
         }
     }
 
-    // 2. Dynamic `FocalPoint` marker
     gizmos.sphere(
         focal_point.0,
         Quat::IDENTITY,
-        0.075,
-        Color::srgba(0.95, 0.75, 0.25, 0.65),
+        0.09,
+        Color::srgba(0.98, 0.78, 0.22, 0.75),
     );
 
-    // 3. Cursor snap sphere & Infinite Magenta Dashed Parallel Alignment Guides
     if cursor_ray.is_valid_hit {
         gizmos.sphere(
             draft.current_preview_end,
             Quat::IDENTITY,
-            0.065,
+            0.075,
             cursor_ray.inference.preview_color(),
         );
 
@@ -2017,24 +2217,21 @@ fn render_infinite_grid_and_tool_gizmos(
                 edge_end,
                 direction,
             } => {
-                // Highlight the referenced neighbor edge in solid Magenta
                 gizmos.line(edge_start, edge_end, INFERENCE_MAGENTA_COLOR);
-
-                // Extend a dashed Magenta guide line from the neighbor's edge and through the viewport cursor
-                let guide_span = 45.0_f32;
-                let edge_mid = (edge_start + edge_end) * 0.5;
-                draw_dashed_gizmo_line(
+                let span = 45.0_f32;
+                let mid = (edge_start + edge_end) * 0.5;
+                render_dashed_segment(
                     &mut gizmos,
-                    edge_mid - direction * guide_span,
-                    edge_mid + direction * guide_span,
+                    mid - direction * span,
+                    mid + direction * span,
                     0.35,
                     0.20,
                     INFERENCE_MAGENTA_COLOR,
                 );
-                draw_dashed_gizmo_line(
+                render_dashed_segment(
                     &mut gizmos,
-                    draft.current_preview_end - direction * guide_span,
-                    draft.current_preview_end + direction * guide_span,
+                    draft.current_preview_end - direction * span,
+                    draft.current_preview_end + direction * span,
                     0.35,
                     0.20,
                     INFERENCE_MAGENTA_COLOR,
@@ -2044,7 +2241,7 @@ fn render_infinite_grid_and_tool_gizmos(
                 elevation_z,
                 face_center,
             } => {
-                draw_dashed_gizmo_line(
+                render_dashed_segment(
                     &mut gizmos,
                     face_center,
                     Vec3::new(
@@ -2061,128 +2258,92 @@ fn render_infinite_grid_and_tool_gizmos(
         }
     }
 
-    // 4. Dynamic Preview Line for Continuous Line Chains
     if tool_state.current == CadTool::LineDraw {
         if let Some(start) = draft.active_start_point {
-            gizmos.sphere(start, Quat::IDENTITY, 0.075, Color::srgb(1.0, 0.92, 0.30));
-
+            gizmos.sphere(start, Quat::IDENTITY, 0.08, Color::srgb(1.0, 0.92, 0.30));
             if cursor_ray.is_valid_hit {
-                let preview_color = cursor_ray.inference.preview_color();
-                gizmos.line(start, draft.current_preview_end, preview_color);
-
-                if cursor_ray.vertical_z_locked || cursor_ray.inference == AxisInference::BlueZ {
-                    draw_dashed_gizmo_line(
-                        &mut gizmos,
-                        Vec3::new(start.x, start.y, -20.0),
-                        Vec3::new(start.x, start.y, 40.0),
-                        0.30,
-                        0.20,
-                        AXIS_BLUE_COLOR,
-                    );
-                }
-            }
-        }
-    }
-
-    // 5. Move Tool Translation Vector & Vertical Blue Axis Guide
-    if tool_state.current == CadTool::Move {
-        if let Some(ref drag) = move_state.active_drag {
-            let current_pos = drag.grab_anchor + drag.current_offset;
-            let color = cursor_ray.inference.preview_color();
-            gizmos.sphere(drag.grab_anchor, Quat::IDENTITY, 0.08, color);
-            draw_dashed_gizmo_line(&mut gizmos, drag.grab_anchor, current_pos, 0.25, 0.15, color);
-
-            if cursor_ray.vertical_z_locked || cursor_ray.inference == AxisInference::BlueZ {
-                draw_dashed_gizmo_line(
-                    &mut gizmos,
-                    Vec3::new(drag.grab_anchor.x, drag.grab_anchor.y, -20.0),
-                    Vec3::new(drag.grab_anchor.x, drag.grab_anchor.y, 40.0),
-                    0.30,
-                    0.20,
-                    AXIS_BLUE_COLOR,
+                gizmos.line(
+                    start,
+                    draft.current_preview_end,
+                    cursor_ray.inference.preview_color(),
                 );
             }
         }
     }
 
-    // 6. Scale Tool 3D Bounding Box & 8 Interactive Vertex Control Handles
+    if tool_state.current == CadTool::Move {
+        if let Some(ref drag) = move_state.active_drag {
+            let dest = drag.grab_anchor + drag.current_offset;
+            let col = cursor_ray.inference.preview_color();
+            gizmos.sphere(drag.grab_anchor, Quat::IDENTITY, 0.08, col);
+            render_dashed_segment(&mut gizmos, drag.grab_anchor, dest, 0.25, 0.15, col);
+        }
+    }
+
     if tool_state.current == CadTool::Scale {
-        if let Some(&sel_entity) = selected.entities.first() {
-            if let Ok(cad_obj) = cad_objects.get(sel_entity) {
-                let active_geom = if let Some(ref drag) = scale_state.active_drag {
+        if let Some(&sel_ent) = selected.entities.first() {
+            if let Ok(obj) = cad_objects.get(sel_ent) {
+                let geom = if let Some(ref drag) = scale_state.active_drag {
                     drag.initial_geometry
                         .scaled_from_anchor(drag.opposite_anchor, drag.current_scale_factors)
                 } else {
-                    cad_obj.geometry.clone()
+                    obj.geometry.clone()
                 };
-
-                let (min_p, max_p) = active_geom.aabb_min_max();
-                let bbox_size = (max_p - min_p).max(Vec3::splat(0.10));
-                let bbox_center = (min_p + max_p) * 0.5;
-
+                let (lo, hi) = geom.bounds_min_max();
                 gizmos.cuboid(
                     Transform {
-                        translation: bbox_center,
+                        translation: (lo + hi) * 0.5,
                         rotation: Quat::IDENTITY,
-                        scale: bbox_size,
+                        scale: (hi - lo).max(Vec3::splat(0.10)),
                     },
                     SCALE_BBOX_COLOR,
                 );
-
-                let corners = active_geom.corners_8();
-                for (idx, &corner_pos) in corners.iter().enumerate() {
-                    let is_active = scale_state
+                for (idx, &pt) in geom.bbox_vertices().iter().enumerate() {
+                    let active = scale_state
                         .active_drag
                         .as_ref()
                         .map(|d| d.handle_index == idx)
                         .unwrap_or(false)
                         || scale_state.hovered_handle == Some(idx);
-
-                    let handle_color = if is_active {
-                        SCALE_ACTIVE_HANDLE_COLOR
-                    } else {
-                        SCALE_HANDLE_COLOR
-                    };
-                    let handle_size = if is_active { 0.18 } else { 0.13 };
-
                     gizmos.cuboid(
                         Transform {
-                            translation: corner_pos,
+                            translation: pt,
                             rotation: Quat::IDENTITY,
-                            scale: Vec3::splat(handle_size),
+                            scale: Vec3::splat(if active { 0.18 } else { 0.13 }),
                         },
-                        handle_color,
+                        if active {
+                            SCALE_ACTIVE_HANDLE_COLOR
+                        } else {
+                            SCALE_HANDLE_COLOR
+                        },
                     );
                 }
             }
         }
     }
 
-    // 7. Wireframe 3D Bounding Box Edges for the Block Tool Preview
-    if tool_state.current == CadTool::Block && cursor_ray.is_valid_hit {
-        if let Some(start_corner) = draft.active_start_point {
-            let end_corner = Vec3::new(
-                draft.current_preview_end.x,
-                draft.current_preview_end.y,
-                start_corner.z + draft.default_block_height,
-            );
-            let min_pt = start_corner.min(end_corner);
-            let max_pt = start_corner.max(end_corner);
-            let size = Vec3::new(
-                (max_pt.x - min_pt.x).max(0.05),
-                (max_pt.y - min_pt.y).max(0.05),
-                (max_pt.z - min_pt.z).max(0.05),
-            );
-            let center = (min_pt + max_pt) * 0.5;
+    // Offset Tool (`[F]`): Highlight source perimeter & live concentric offset preview
+    if tool_state.current == CadTool::Offset {
+        let contour_ref = offset_state
+            .active_contour
+            .as_ref()
+            .or(offset_state.hovered_contour.as_ref());
 
-            gizmos.cuboid(
-                Transform {
-                    translation: center,
-                    rotation: Quat::IDENTITY,
-                    scale: size,
-                },
-                Color::srgb(0.35, 0.82, 1.0),
-            );
+        if let Some(contour) = contour_ref {
+            for &(a, b) in &contour.segments {
+                gizmos.line(a, b, OFFSET_HIGHLIGHT_COLOR);
+                gizmos.sphere(a, Quat::IDENTITY, 0.055, OFFSET_HIGHLIGHT_COLOR);
+            }
+            gizmos.sphere(contour.center, Quat::IDENTITY, 0.07, OFFSET_HIGHLIGHT_COLOR);
+
+            if offset_state.is_dragging && offset_state.current_offset_distance.abs() > 0.01 {
+                let preview_segs =
+                    contour.compute_offset_segments(offset_state.current_offset_distance);
+                for (pa, pb) in preview_segs {
+                    gizmos.line(pa, pb, OFFSET_PREVIEW_COLOR);
+                    gizmos.sphere(pa, Quat::IDENTITY, 0.05, OFFSET_PREVIEW_COLOR);
+                }
+            }
         }
     }
 }
