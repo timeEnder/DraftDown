@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 
 use bevy::math::primitives::{Cuboid, Cylinder, Sphere};
 use bevy::prelude::*;
+use bevy::render::mesh::{Indices, PrimitiveTopology};
+use bevy::render::render_asset::RenderAssetUsages;
 
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CadCommandExecutionSet;
@@ -626,15 +628,216 @@ impl Command for CreateOffsetCommand {
     }
 }
 
+pub fn build_stitched_extrusion_mesh(
+    initial_boundary_loop: &[Vec3],
+    face_normal: Dir3,
+    extrude_distance: f32,
+) -> (Mesh, Vec3, Vec3) {
+    let signed_dist = if extrude_distance.abs() < 0.05_f32 {
+        if extrude_distance >= 0.0_f32 {
+            0.05_f32
+        } else {
+            -0.05_f32
+        }
+    } else {
+        extrude_distance
+    };
+
+    let extrude_vec = face_normal.as_vec3() * signed_dist;
+    let axis_dir = if signed_dist >= 0.0_f32 {
+        face_normal.as_vec3()
+    } else {
+        -face_normal.as_vec3()
+    }
+    .normalize_or_zero();
+
+    let mut ordered_base: Vec<Vec3> = initial_boundary_loop.to_vec();
+    let count = ordered_base.len();
+
+    if count < 3 {
+        let fallback_size = Vec3::ONE;
+        return (
+            Mesh::from(Cuboid::from_size(fallback_size)),
+            Vec3::ZERO,
+            fallback_size,
+        );
+    }
+
+    let mut newell = Vec3::ZERO;
+    for i in 0..count {
+        let curr = ordered_base[i];
+        let next = ordered_base[(i + 1) % count];
+        newell.x += (curr.y - next.y) * (curr.z + next.z);
+        newell.y += (curr.z - next.z) * (curr.x + next.x);
+        newell.z += (curr.x - next.x) * (curr.y + next.y);
+    }
+    if newell.dot(axis_dir) < 0.0_f32 {
+        ordered_base.reverse();
+    }
+
+    let mut min_pt = Vec3::splat(f32::MAX);
+    let mut max_pt = Vec3::splat(f32::MIN);
+    for b in &ordered_base {
+        let t = *b + extrude_vec;
+        min_pt = min_pt.min(*b).min(t);
+        max_pt = max_pt.max(*b).max(t);
+    }
+
+    let solid_center = (min_pt + max_pt) * 0.5_f32;
+    let solid_size = (max_pt - min_pt).max(Vec3::splat(0.05_f32));
+
+    let local_base: Vec<Vec3> = ordered_base.iter().map(|p| *p - solid_center).collect();
+    let local_top: Vec<Vec3> = ordered_base
+        .iter()
+        .map(|p| (*p + extrude_vec) - solid_center)
+        .collect();
+
+    let cap_triangles = count.saturating_sub(2);
+    let total_vertices = count * 4 + count * 2;
+    let total_indices = count * 6 + cap_triangles * 6;
+
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(total_vertices);
+    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(total_vertices);
+    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(total_vertices);
+    let mut indices: Vec<u32> = Vec::with_capacity(total_indices);
+
+    // 1. Stitch N side-wall quads (2N triangles) connecting initial boundary edges to extruded edges
+    for i in 0..count {
+        let next_i = (i + 1) % count;
+        let b0 = local_base[i];
+        let b1 = local_base[next_i];
+        let t1 = local_top[next_i];
+        let t0 = local_top[i];
+
+        let edge_vec = b1 - b0;
+        let up_vec = t0 - b0;
+        let mut outward_normal = edge_vec.cross(up_vec).normalize_or_zero();
+        let quad_centroid = (b0 + b1 + t1 + t0) * 0.25_f32;
+
+        let base_idx = positions.len() as u32;
+        if outward_normal.dot(quad_centroid) < 0.0_f32 {
+            outward_normal = -outward_normal;
+            let n_arr = outward_normal.to_array();
+            positions.push(b0.to_array());
+            positions.push(t0.to_array());
+            positions.push(t1.to_array());
+            positions.push(b1.to_array());
+            normals.extend_from_slice(&[n_arr, n_arr, n_arr, n_arr]);
+            uvs.extend_from_slice(&[[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]]);
+            indices.extend_from_slice(&[
+                base_idx,
+                base_idx + 1,
+                base_idx + 2,
+                base_idx,
+                base_idx + 2,
+                base_idx + 3,
+            ]);
+        } else {
+            let n_arr = outward_normal.to_array();
+            positions.push(b0.to_array());
+            positions.push(b1.to_array());
+            positions.push(t1.to_array());
+            positions.push(t0.to_array());
+            normals.extend_from_slice(&[n_arr, n_arr, n_arr, n_arr]);
+            uvs.extend_from_slice(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+            indices.extend_from_slice(&[
+                base_idx,
+                base_idx + 1,
+                base_idx + 2,
+                base_idx,
+                base_idx + 2,
+                base_idx + 3,
+            ]);
+        }
+    }
+
+    // 2. Stitch top extruded cap polygon (outward normal = +axis_dir)
+    let top_base_idx = positions.len() as u32;
+    let top_n_arr = axis_dir.to_array();
+    for v in &local_top {
+        positions.push(v.to_array());
+        normals.push(top_n_arr);
+        uvs.push([v.x, v.y]);
+    }
+    for k in 1..(count - 1) {
+        indices.push(top_base_idx);
+        indices.push(top_base_idx + k as u32);
+        indices.push(top_base_idx + (k + 1) as u32);
+    }
+
+    // 3. Stitch bottom base cap polygon (outward normal = -axis_dir)
+    let bot_base_idx = positions.len() as u32;
+    let bot_n_arr = (-axis_dir).to_array();
+    for v in &local_base {
+        positions.push(v.to_array());
+        normals.push(bot_n_arr);
+        uvs.push([v.x, v.y]);
+    }
+    for k in 1..(count - 1) {
+        indices.push(bot_base_idx);
+        indices.push(bot_base_idx + (k + 1) as u32);
+        indices.push(bot_base_idx + k as u32);
+    }
+
+    let mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_indices(Indices::U32(indices));
+
+    (mesh, solid_center, solid_size)
+}
+
+pub fn apply_stitched_extrusion_to_block_entity(
+    world: &mut World,
+    target: Entity,
+    stationary_base_loop: &[Vec3],
+    face_normal: Dir3,
+    total_depth: f32,
+) {
+    let (stitched_mesh, new_center, new_size) =
+        build_stitched_extrusion_mesh(stationary_base_loop, face_normal, total_depth);
+
+    let mesh_handle = {
+        let mut meshes = world.resource_mut::<Assets<Mesh>>();
+        meshes.add(stitched_mesh)
+    };
+
+    let new_geom = CadGeometryKind::Block {
+        center: new_center,
+        size: new_size,
+    };
+
+    if let Some(mut ent_mut) = world.get_entity_mut(target) {
+        if let Some(mut obj) = ent_mut.get_mut::<CadObject>() {
+            obj.geometry = new_geom;
+        }
+        if let Some(mut tf) = ent_mut.get_mut::<Transform>() {
+            tf.translation = new_center;
+            tf.rotation = Quat::IDENTITY;
+            tf.scale = Vec3::ONE;
+        }
+        if let Some(mut mh) = ent_mut.get_mut::<Handle<Mesh>>() {
+            *mh = mesh_handle;
+        }
+    }
+}
+
 pub struct PushPullCommand {
     target_entity: Option<Entity>,
     before_geometry: Option<CadGeometryKind>,
     after_geometry: Option<CadGeometryKind>,
-    extruded_solid_block: Option<(Vec3, Vec3)>,
-    boundary_wall_segments: Vec<(Vec3, Vec3)>,
+    initial_boundary_loop: Vec<Vec3>,
+    stationary_opposite_loop: Vec<Vec3>,
+    face_normal: Dir3,
+    extrude_distance: f32,
+    total_block_depth_after: f32,
     color: Color,
     group_id: Option<GroupId>,
-    spawned_entities: Vec<Entity>,
+    spawned_solid_entity: Option<Entity>,
 }
 
 impl PushPullCommand {
@@ -642,19 +845,43 @@ impl PushPullCommand {
         entity: Entity,
         before: CadGeometryKind,
         after: CadGeometryKind,
-        boundary_wall_segments: Vec<(Vec3, Vec3)>,
+        initial_boundary_loop: Vec<Vec3>,
+        face_normal: Dir3,
+        extrude_distance: f32,
         color: Color,
         group_id: Option<GroupId>,
     ) -> Self {
+        let n = face_normal.as_vec3();
+        let old_depth = match before {
+            CadGeometryKind::Block { size, .. } => {
+                if n.z.abs() > 0.9_f32 {
+                    size.z
+                } else if n.x.abs() > 0.9_f32 {
+                    size.x
+                } else {
+                    size.y
+                }
+            }
+            CadGeometryKind::Line { .. } => 1.0_f32,
+        };
+        let stationary_opposite_loop: Vec<Vec3> = initial_boundary_loop
+            .iter()
+            .map(|v| *v - n * old_depth)
+            .collect();
+        let total_block_depth_after = (old_depth + extrude_distance).max(0.1_f32);
+
         Self {
             target_entity: Some(entity),
             before_geometry: Some(before),
             after_geometry: Some(after),
-            extruded_solid_block: None,
-            boundary_wall_segments,
+            initial_boundary_loop,
+            stationary_opposite_loop,
+            face_normal,
+            extrude_distance,
+            total_block_depth_after,
             color,
             group_id,
-            spawned_entities: Vec::new(),
+            spawned_solid_entity: None,
         }
     }
 
@@ -665,94 +892,94 @@ impl PushPullCommand {
         color: Color,
         group_id: Option<GroupId>,
     ) -> Self {
-        let shift = normal.as_vec3() * distance;
-        let count = base_vertices.len();
-        let mut wall_segments = Vec::with_capacity(count * 2);
-
-        let mut min_pt = Vec3::splat(f32::MAX);
-        let mut max_pt = Vec3::splat(f32::MIN);
-
-        for i in 0..count {
-            let b0 = base_vertices[i];
-            let b1 = base_vertices[(i + 1) % count];
-            let t0 = b0 + shift;
-            let t1 = b1 + shift;
-
-            wall_segments.push((b0, t0));
-            wall_segments.push((t0, t1));
-
-            min_pt = min_pt.min(b0).min(t0);
-            max_pt = max_pt.max(b0).max(t0);
-        }
-
-        let span = (max_pt - min_pt).max(Vec3::splat(0.1_f32));
-        let center = (min_pt + max_pt) * 0.5_f32;
-
         Self {
             target_entity: None,
             before_geometry: None,
             after_geometry: None,
-            extruded_solid_block: Some((center, span)),
-            boundary_wall_segments: wall_segments,
+            initial_boundary_loop: base_vertices.to_vec(),
+            stationary_opposite_loop: base_vertices.to_vec(),
+            face_normal: normal,
+            extrude_distance: distance,
+            total_block_depth_after: distance,
             color,
             group_id,
-            spawned_entities: Vec::new(),
+            spawned_solid_entity: None,
         }
     }
 }
 
 impl Command for PushPullCommand {
     fn execute(&mut self, world: &mut World) {
-        self.spawned_entities.clear();
-
-        if let (Some(entity), Some(after)) = (self.target_entity, self.after_geometry) {
-            apply_geometry_to_existing_entity(world, entity, after);
+        if let Some(entity) = self.target_entity {
+            if self.stationary_opposite_loop.len() >= 3 {
+                apply_stitched_extrusion_to_block_entity(
+                    world,
+                    entity,
+                    &self.stationary_opposite_loop,
+                    self.face_normal,
+                    self.total_block_depth_after,
+                );
+            } else if let Some(after) = self.after_geometry {
+                apply_geometry_to_existing_entity(world, entity, after);
+            }
+            return;
         }
 
-        if let Some((center, size)) = self.extruded_solid_block {
+        if self.initial_boundary_loop.len() >= 3 {
+            let (stitched_mesh, solid_center, solid_size) = build_stitched_extrusion_mesh(
+                &self.initial_boundary_loop,
+                self.face_normal,
+                self.extrude_distance,
+            );
+
             let serial = world
                 .get_resource_mut::<NextObjectSerial>()
                 .map(|mut s| s.next_id())
                 .unwrap_or(1);
 
-            let block_obj = CadObject {
-                label: format!("Extruded Block #{serial}"),
+            let (mesh_handle, mat_handle) = {
+                let mut meshes = world.resource_mut::<Assets<Mesh>>();
+                let mh = meshes.add(stitched_mesh);
+                let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
+                let mat = materials.add(StandardMaterial {
+                    base_color: self.color,
+                    perceptual_roughness: 0.45_f32,
+                    metallic: 0.08_f32,
+                    ..default()
+                });
+                (mh, mat)
+            };
+
+            let cad_obj = CadObject {
+                label: format!("Extruded Solid #{serial}"),
                 group_id: self.group_id,
                 material_color: MaterialColor(self.color),
-                geometry: CadGeometryKind::Block { center, size },
-            };
-            let ent = instantiate_cad_entity(world, block_obj);
-            self.spawned_entities.push(ent);
-        }
-
-        let wall_color = Color::srgb(0.86, 0.90, 0.96);
-        for (start, end) in self.boundary_wall_segments.clone() {
-            if start.distance(end) < 0.01_f32 {
-                continue;
-            }
-            let serial = world
-                .get_resource_mut::<NextObjectSerial>()
-                .map(|mut s| s.next_id())
-                .unwrap_or(1);
-
-            let wall_edge = CadObject {
-                label: format!("Extrude Wall Edge #{serial}"),
-                group_id: self.group_id,
-                material_color: MaterialColor(wall_color),
-                geometry: CadGeometryKind::Line {
-                    start,
-                    end,
-                    radius: 0.036_f32,
+                geometry: CadGeometryKind::Block {
+                    center: solid_center,
+                    size: solid_size,
                 },
             };
-            let ent = instantiate_cad_entity(world, wall_edge);
-            self.spawned_entities.push(ent);
+
+            let spawned = world
+                .spawn((
+                    PbrBundle {
+                        mesh: mesh_handle,
+                        material: mat_handle,
+                        transform: Transform::from_translation(solid_center),
+                        ..default()
+                    },
+                    cad_obj.material_color,
+                    cad_obj,
+                ))
+                .id();
+
+            self.spawned_solid_entity = Some(spawned);
         }
     }
 
     fn undo(&mut self, world: &mut World) {
-        for ent in self.spawned_entities.drain(..) {
-            remove_cad_entity(world, ent);
+        if let Some(spawned) = self.spawned_solid_entity.take() {
+            remove_cad_entity(world, spawned);
         }
 
         if let (Some(entity), Some(before)) = (self.target_entity, self.before_geometry) {
@@ -761,7 +988,7 @@ impl Command for PushPullCommand {
     }
 
     fn description(&self) -> &'static str {
-        "Push/Pull Extrude Face"
+        "Push/Pull Extrude Solid"
     }
 }
 

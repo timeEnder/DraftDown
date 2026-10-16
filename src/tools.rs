@@ -1738,6 +1738,7 @@ fn handle_block_tool_interaction(
 fn sync_block_preview_entity(
     active_tool: Res<ActiveToolState>,
     draft_state: Res<ToolDraftState>,
+    push_pull_state: Res<PushPullToolState>,
     mut preview_query: Query<(&mut Transform, &mut Visibility), With<BlockPreviewVisual>>,
 ) {
     let Ok((mut tf, mut vis)) = preview_query.get_single_mut() else {
@@ -1764,6 +1765,26 @@ fn sync_block_preview_entity(
             tf.scale = size;
             *vis = Visibility::Visible;
             return;
+        }
+    }
+
+    if active_tool.current == CadTool::PushPullExtrude && push_pull_state.is_dragging {
+        if let Some(ref face) = push_pull_state.active_face {
+            if !face.is_block_face && push_pull_state.current_extrude_distance.abs() >= 0.02_f32 {
+                let shift =
+                    face.contour.plane_normal.as_vec3() * push_pull_state.current_extrude_distance;
+                let mut min_pt = Vec3::splat(f32::MAX);
+                let mut max_pt = Vec3::splat(f32::MIN);
+                for v in face.contour.vertices_3d() {
+                    let t = v + shift;
+                    min_pt = min_pt.min(v).min(t);
+                    max_pt = max_pt.max(v).max(t);
+                }
+                tf.translation = (min_pt + max_pt) * 0.5_f32;
+                tf.scale = (max_pt - min_pt).max(Vec3::splat(0.05_f32));
+                *vis = Visibility::Visible;
+                return;
+            }
         }
     }
 
@@ -3063,7 +3084,6 @@ fn handle_push_pull_tool_interaction(
     if mouse_buttons.just_released(MouseButton::Left) {
         let finished_face = push_pull_state.active_face.take();
         let dist = push_pull_state.current_extrude_distance;
-        let wall_segments = push_pull_state.preview_wall_segments.clone();
         push_pull_state.reset_drag();
 
         if let Some(face) = finished_face {
@@ -3082,6 +3102,8 @@ fn handle_push_pull_tool_interaction(
                     .contour
                     .group_id
                     .or_else(|| Some(next_group.allocate()));
+                let initial_boundary_loop = face.contour.vertices_3d();
+
                 if face.is_block_face {
                     let before = face.original_object.geometry;
                     let after = before.extruded_along_face(face.contour.plane_normal, dist);
@@ -3089,14 +3111,38 @@ fn handle_push_pull_tool_interaction(
                         face.entity,
                         before,
                         after,
-                        wall_segments,
+                        initial_boundary_loop,
+                        face.contour.plane_normal,
+                        dist,
                         face.original_object.material_color.0,
                         group_opt,
                     )));
+
+                    let shift = face.contour.plane_normal.as_vec3() * dist;
+                    let shifted_verts: Vec<Vec3> = face
+                        .contour
+                        .vertices_3d()
+                        .into_iter()
+                        .map(|v| v + shift)
+                        .collect();
+                    if let Some(updated_contour) = OffsetContour::from_coplanar_loop_3d(
+                        &shifted_verts,
+                        Some(face.contour.plane_normal),
+                        group_opt,
+                    ) {
+                        let mut updated_obj = face.original_object.clone();
+                        updated_obj.geometry = after;
+                        push_pull_state.last_selected_face = Some(ExtrudableFace {
+                            entity: face.entity,
+                            is_block_face: true,
+                            original_object: updated_obj,
+                            contour: updated_contour,
+                            drag_anchor_3d: face.drag_anchor_3d + shift,
+                        });
+                    }
                 } else {
-                    let base_verts = face.contour.vertices_3d();
                     history.execute_command(Box::new(PushPullCommand::for_closed_face_loop(
-                        &base_verts,
+                        &initial_boundary_loop,
                         face.contour.plane_normal,
                         dist,
                         Color::srgb(0.74, 0.80, 0.88),
@@ -3295,14 +3341,15 @@ fn process_vcb_commit_requests(
             CadTool::PushPullExtrude => {
                 let distance = parts[0];
                 if distance.abs() >= 0.01_f32 {
+                    let was_dragging = push_pull_state.is_dragging;
                     let target_face = push_pull_state
                         .active_face
                         .clone()
-                        .or_else(|| push_pull_state.last_selected_face.clone())
-                        .or_else(|| push_pull_state.hovered_face.clone());
+                        .or_else(|| push_pull_state.hovered_face.clone())
+                        .or_else(|| push_pull_state.last_selected_face.clone());
 
                     if let Some(face) = target_face {
-                        if face.is_block_face {
+                        if was_dragging && face.is_block_face {
                             apply_live_object_preview(
                                 face.entity,
                                 &face.original_object,
@@ -3319,21 +3366,50 @@ fn process_vcb_commit_requests(
                             .or_else(|| Some(next_group.allocate()));
 
                         if face.is_block_face {
-                            let latest_before = cad_objects
-                                .get(face.entity)
-                                .map(|(_, o)| o.geometry)
-                                .unwrap_or(face.original_object.geometry);
+                            let latest_before = if was_dragging {
+                                face.original_object.geometry
+                            } else {
+                                cad_objects
+                                    .get(face.entity)
+                                    .map(|(_, o)| o.geometry)
+                                    .unwrap_or(face.original_object.geometry)
+                            };
                             let after = latest_before
                                 .extruded_along_face(face.contour.plane_normal, distance);
-                            let walls = face.build_wall_segments(distance);
+                            let initial_boundary_loop = face.contour.vertices_3d();
                             history.execute_command(Box::new(PushPullCommand::for_block_face(
                                 face.entity,
                                 latest_before,
                                 after,
-                                walls,
+                                initial_boundary_loop,
+                                face.contour.plane_normal,
+                                distance,
                                 face.original_object.material_color.0,
                                 group_opt,
                             )));
+
+                            let shift = face.contour.plane_normal.as_vec3() * distance;
+                            let shifted_verts: Vec<Vec3> = face
+                                .contour
+                                .vertices_3d()
+                                .into_iter()
+                                .map(|v| v + shift)
+                                .collect();
+                            if let Some(updated_contour) = OffsetContour::from_coplanar_loop_3d(
+                                &shifted_verts,
+                                Some(face.contour.plane_normal),
+                                group_opt,
+                            ) {
+                                let mut updated_obj = face.original_object.clone();
+                                updated_obj.geometry = after;
+                                push_pull_state.last_selected_face = Some(ExtrudableFace {
+                                    entity: face.entity,
+                                    is_block_face: true,
+                                    original_object: updated_obj,
+                                    contour: updated_contour,
+                                    drag_anchor_3d: face.drag_anchor_3d + shift,
+                                });
+                            }
                         } else {
                             let base_verts = face.contour.vertices_3d();
                             history.execute_command(Box::new(
@@ -3374,6 +3450,14 @@ fn apply_live_object_preview(
     transforms: &mut Query<&mut Transform>,
     meshes: &mut Assets<Mesh>,
 ) {
+    let old_size = cad_objects
+        .get(entity)
+        .ok()
+        .and_then(|(_, o)| match o.geometry {
+            CadGeometryKind::Block { size, .. } => Some(size),
+            CadGeometryKind::Line { .. } => None,
+        });
+
     if let Ok((_, mut obj_comp)) = cad_objects.get_mut(entity) {
         *obj_comp = updated_obj.clone();
     }
@@ -3387,8 +3471,16 @@ fn apply_live_object_preview(
                 tf.rotation = Quat::from_rotation_arc(Vec3::Y, dir);
                 let _ = (radius, meshes);
             }
-            CadGeometryKind::Block { center, .. } => {
+            CadGeometryKind::Block { center, size } => {
                 tf.translation = center;
+                if let Some(prev) = old_size {
+                    let ratio = Vec3::new(
+                        (size.x / prev.x.max(0.05_f32)).clamp(0.05_f32, 50.0_f32),
+                        (size.y / prev.y.max(0.05_f32)).clamp(0.05_f32, 50.0_f32),
+                        (size.z / prev.z.max(0.05_f32)).clamp(0.05_f32, 50.0_f32),
+                    );
+                    tf.scale *= ratio;
+                }
             }
         }
     }
@@ -3415,6 +3507,7 @@ fn restore_object_geometry(
             }
             CadGeometryKind::Block { center, .. } => {
                 tf.translation = center;
+                tf.scale = Vec3::ONE;
             }
         }
     }
