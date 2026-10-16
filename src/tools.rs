@@ -26,6 +26,7 @@ const GRID_SNAP_STEP: f32 = 1.0_f32;
 const SUB_GRID_SNAP_STEP: f32 = 0.25_f32;
 const OFFSET_SNAP_STEP: f32 = 0.05_f32;
 const EXTRUDE_SNAP_STEP: f32 = 0.10_f32;
+const VERTEX_SNAP_RADIUS: f32 = 0.35_f32;
 const AXIS_SNAP_COS_THRESHOLD: f32 = 0.990_f32;
 const DIAGONAL_SNAP_TOLERANCE_DEG: f32 = 2.0_f32;
 const PARALLEL_THRESHOLD_DEG: f32 = 2.0_f32;
@@ -411,6 +412,7 @@ pub struct OffsetContour {
     pub vertices_uv: Vec<Vec2>,
     pub winding_sign: f32,
     pub group_id: Option<GroupId>,
+    pub snapped_vertex: Option<Vec3>,
 }
 
 impl OffsetContour {
@@ -518,7 +520,19 @@ impl OffsetContour {
             vertices_uv,
             winding_sign,
             group_id,
+            snapped_vertex: None,
         })
+    }
+
+    pub fn with_vertex_zero_origin(mut self, vertex_3d: Vec3) -> Self {
+        let vertex_uv = self.project_world_to_uv(vertex_3d);
+        let flush_vertex = self.bind_uv_flush_to_plane(vertex_uv);
+        for uv in &mut self.vertices_uv {
+            *uv -= vertex_uv;
+        }
+        self.plane_origin = flush_vertex;
+        self.snapped_vertex = Some(flush_vertex);
+        self
     }
 
     pub fn project_world_to_uv(&self, world_pt: Vec3) -> Vec2 {
@@ -594,8 +608,16 @@ impl OffsetContour {
 
     pub fn signed_offset_from_cursor(&self, cursor_on_plane_3d: Vec3) -> f32 {
         let cursor_uv = self.project_world_to_uv(cursor_on_plane_3d);
+        self.signed_offset_from_uv(cursor_uv)
+    }
+
+    pub fn signed_offset_from_uv(&self, cursor_uv: Vec2) -> f32 {
         let count = self.vertices_uv.len();
         if count < 3 {
+            return 0.0_f32;
+        }
+
+        if self.snapped_vertex.is_some() && cursor_uv.length() < 0.015_f32 {
             return 0.0_f32;
         }
 
@@ -764,6 +786,7 @@ pub struct OffsetToolState {
     pub active_contour: Option<OffsetContour>,
     pub is_dragging: bool,
     pub current_offset_distance: f32,
+    pub drag_uv_zero_correction: Vec2,
     pub preview_segments: Vec<(Vec3, Vec3)>,
 }
 
@@ -772,6 +795,7 @@ impl OffsetToolState {
         self.active_contour = None;
         self.is_dragging = false;
         self.current_offset_distance = 0.0_f32;
+        self.drag_uv_zero_correction = Vec2::ZERO;
         self.preview_segments.clear();
     }
 }
@@ -2281,6 +2305,247 @@ pub fn raycast_block_face_exact(
     best_hit
 }
 
+fn enumerate_block_faces(
+    center: Vec3,
+    size: Vec3,
+) -> [(Dir3, Vec3, Vec3, Vec3, f32, f32, [Vec3; 4]); 6] {
+    let half = size * 0.5_f32;
+    let min = center - half;
+    let max = center + half;
+    [
+        (
+            Dir3::Z,
+            Vec3::new(center.x, center.y, max.z),
+            Vec3::X,
+            Vec3::Y,
+            half.x,
+            half.y,
+            [
+                Vec3::new(min.x, min.y, max.z),
+                Vec3::new(max.x, min.y, max.z),
+                Vec3::new(max.x, max.y, max.z),
+                Vec3::new(min.x, max.y, max.z),
+            ],
+        ),
+        (
+            Dir3::NEG_Z,
+            Vec3::new(center.x, center.y, min.z),
+            Vec3::X,
+            Vec3::NEG_Y,
+            half.x,
+            half.y,
+            [
+                Vec3::new(min.x, min.y, min.z),
+                Vec3::new(min.x, max.y, min.z),
+                Vec3::new(max.x, max.y, min.z),
+                Vec3::new(max.x, min.y, min.z),
+            ],
+        ),
+        (
+            Dir3::X,
+            Vec3::new(max.x, center.y, center.z),
+            Vec3::Y,
+            Vec3::Z,
+            half.y,
+            half.z,
+            [
+                Vec3::new(max.x, min.y, min.z),
+                Vec3::new(max.x, max.y, min.z),
+                Vec3::new(max.x, max.y, max.z),
+                Vec3::new(max.x, min.y, max.z),
+            ],
+        ),
+        (
+            Dir3::NEG_X,
+            Vec3::new(min.x, center.y, center.z),
+            Vec3::NEG_Y,
+            Vec3::Z,
+            half.y,
+            half.z,
+            [
+                Vec3::new(min.x, max.y, min.z),
+                Vec3::new(min.x, min.y, min.z),
+                Vec3::new(min.x, min.y, max.z),
+                Vec3::new(min.x, max.y, max.z),
+            ],
+        ),
+        (
+            Dir3::Y,
+            Vec3::new(center.x, max.y, center.z),
+            Vec3::NEG_X,
+            Vec3::Z,
+            half.x,
+            half.z,
+            [
+                Vec3::new(max.x, max.y, min.z),
+                Vec3::new(min.x, max.y, min.z),
+                Vec3::new(min.x, max.y, max.z),
+                Vec3::new(max.x, max.y, max.z),
+            ],
+        ),
+        (
+            Dir3::NEG_Y,
+            Vec3::new(center.x, min.y, center.z),
+            Vec3::X,
+            Vec3::Z,
+            half.x,
+            half.z,
+            [
+                Vec3::new(min.x, min.y, min.z),
+                Vec3::new(max.x, min.y, min.z),
+                Vec3::new(max.x, min.y, max.z),
+                Vec3::new(min.x, min.y, max.z),
+            ],
+        ),
+    ]
+}
+
+fn collect_object_snap_vertices(obj: &CadObject) -> Vec<Vec3> {
+    match obj.geometry {
+        CadGeometryKind::Line { start, end, .. } => {
+            vec![start, end, (start + end) * 0.5_f32]
+        }
+        CadGeometryKind::Block { .. } => {
+            let corners = compute_object_bbox_corners(obj);
+            let edges = collect_object_edges(obj);
+            let mut pts = Vec::with_capacity(corners.len() + edges.len());
+            pts.extend_from_slice(&corners);
+            for (a, b) in edges {
+                pts.push((a + b) * 0.5_f32);
+            }
+            pts
+        }
+    }
+}
+
+fn resolve_block_face_sharing_vertex(
+    ray: Ray3d,
+    center: Vec3,
+    size: Vec3,
+    vertex_3d: Vec3,
+    group_id: Option<GroupId>,
+) -> Option<OffsetContour> {
+    let plane_tol = 0.03_f32;
+
+    if let Some(direct_hit) = raycast_block_face_exact(ray, center, size) {
+        let dist_to_plane = (vertex_3d - direct_hit.plane_origin)
+            .dot(direct_hit.normal.as_vec3())
+            .abs();
+        if dist_to_plane <= plane_tol {
+            if let Some(contour) = OffsetContour::from_block_face_hit(&direct_hit, group_id) {
+                return Some(contour.with_vertex_zero_origin(vertex_3d));
+            }
+        }
+    }
+
+    let ray_dir = ray.direction.as_vec3();
+    let faces = enumerate_block_faces(center, size);
+    let mut best_score = f32::NEG_INFINITY;
+    let mut best_face: Option<BlockFaceHit> = None;
+
+    for (normal, plane_origin, u_axis, v_axis, half_u, half_v, vertices) in faces {
+        let normal_vec = normal.as_vec3();
+        let plane_dist = (vertex_3d - plane_origin).dot(normal_vec).abs();
+        if plane_dist > plane_tol {
+            continue;
+        }
+        let rel = vertex_3d - plane_origin;
+        let u_dist = rel.dot(u_axis).abs();
+        let v_dist = rel.dot(v_axis).abs();
+        if u_dist > half_u + plane_tol || v_dist > half_v + plane_tol {
+            continue;
+        }
+
+        let facing = -ray_dir.dot(normal_vec);
+        let horiz_bonus = if normal_vec.z > 0.9_f32 && facing > 0.05_f32 {
+            0.25_f32
+        } else {
+            0.0_f32
+        };
+        let score = facing + horiz_bonus;
+        if score > best_score {
+            best_score = score;
+            best_face = Some(BlockFaceHit {
+                t: ray.origin.distance(vertex_3d),
+                hit_point: vertex_3d,
+                plane_origin,
+                normal,
+                vertices,
+            });
+        }
+    }
+
+    let resolved = best_face?;
+    let contour = OffsetContour::from_block_face_hit(&resolved, group_id)?;
+    Some(contour.with_vertex_zero_origin(vertex_3d))
+}
+
+fn resolve_vertex_parent_face_contour(
+    ray: Ray3d,
+    cad_objects: &Query<(Entity, &CadObject)>,
+) -> Option<(Entity, OffsetContour, f32)> {
+    let mut closest_vertex_t = f32::MAX;
+    let mut matched_entity: Option<Entity> = None;
+    let mut matched_obj: Option<CadObject> = None;
+    let mut snapped_vertex_3d = Vec3::ZERO;
+
+    for (entity, obj) in cad_objects.iter() {
+        for v_pt in collect_object_snap_vertices(obj) {
+            if let Some(t) = ray_intersects_sphere(ray, v_pt, VERTEX_SNAP_RADIUS) {
+                if t < closest_vertex_t {
+                    closest_vertex_t = t;
+                    matched_entity = Some(entity);
+                    matched_obj = Some(obj.clone());
+                    snapped_vertex_3d = v_pt;
+                }
+            }
+        }
+    }
+
+    let parent_ent = matched_entity?;
+    let parent_obj = matched_obj?;
+
+    match parent_obj.geometry {
+        CadGeometryKind::Block { center, size } => {
+            let contour = resolve_block_face_sharing_vertex(
+                ray,
+                center,
+                size,
+                snapped_vertex_3d,
+                parent_obj.group_id,
+            )?;
+            Some((parent_ent, contour, closest_vertex_t))
+        }
+        CadGeometryKind::Line { start, end, .. } => {
+            if let Some(contour) =
+                detect_closed_line_loop_contour(start, end, parent_obj.group_id, cad_objects)
+            {
+                return Some((
+                    parent_ent,
+                    contour.with_vertex_zero_origin(snapped_vertex_3d),
+                    closest_vertex_t,
+                ));
+            }
+
+            for (block_ent, block_obj) in cad_objects.iter() {
+                if let CadGeometryKind::Block { center, size } = block_obj.geometry {
+                    if let Some(contour) = resolve_block_face_sharing_vertex(
+                        ray,
+                        center,
+                        size,
+                        snapped_vertex_3d,
+                        block_obj.group_id,
+                    ) {
+                        return Some((block_ent, contour, closest_vertex_t));
+                    }
+                }
+            }
+
+            None
+        }
+    }
+}
+
 fn handle_offset_tool_interaction(
     active_tool: Res<ActiveToolState>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
@@ -2289,6 +2554,7 @@ fn handle_offset_tool_interaction(
     cad_objects: Query<(Entity, &CadObject)>,
     mut selected: ResMut<SelectedCadObjects>,
     mut offset_state: ResMut<OffsetToolState>,
+    mut vcb: ResMut<VcbInput>,
     mut next_group: ResMut<NextGroupId>,
     mut history: ResMut<CommandHistory>,
     mut egui_contexts: EguiContexts,
@@ -2328,10 +2594,26 @@ fn handle_offset_tool_interaction(
                 offset_state.hovered_contour = Some(contour.clone());
                 if mouse_buttons.just_pressed(MouseButton::Left) {
                     selected.select_single(hit_ent);
+                    let uv_zero_correction = if contour.snapped_vertex.is_some() {
+                        intersect_ray_with_plane(
+                            ray,
+                            contour.plane_origin,
+                            contour.plane_normal,
+                            MAX_PLANE_RAY_DIST * 2.0_f32,
+                        )
+                        .map(|hit_3d| -contour.project_world_to_uv(hit_3d))
+                        .unwrap_or(Vec2::ZERO)
+                    } else {
+                        Vec2::ZERO
+                    };
                     offset_state.active_contour = Some(contour);
                     offset_state.is_dragging = true;
                     offset_state.current_offset_distance = 0.0_f32;
+                    offset_state.drag_uv_zero_correction = uv_zero_correction;
                     offset_state.preview_segments.clear();
+                    if vcb.buffer.is_empty() {
+                        vcb.last_status = "Offset: 0.00 m".to_string();
+                    }
                 }
             }
         }
@@ -2340,6 +2622,7 @@ fn handle_offset_tool_interaction(
 
     if mouse_buttons.pressed(MouseButton::Left) {
         if let Some(ray) = cursor_ray {
+            let uv_correction = offset_state.drag_uv_zero_correction;
             let computed_preview = if let Some(ref contour) = offset_state.active_contour {
                 intersect_ray_with_plane(
                     ray,
@@ -2348,7 +2631,8 @@ fn handle_offset_tool_interaction(
                     MAX_PLANE_RAY_DIST * 2.0_f32,
                 )
                 .map(|hit_3d| {
-                    let raw_offset = contour.signed_offset_from_cursor(hit_3d);
+                    let adjusted_uv = contour.project_world_to_uv(hit_3d) + uv_correction;
+                    let raw_offset = contour.signed_offset_from_uv(adjusted_uv);
                     let snapped_offset =
                         (raw_offset / OFFSET_SNAP_STEP).round() * OFFSET_SNAP_STEP;
                     let segments = contour.compute_offset_segments(snapped_offset);
@@ -2361,6 +2645,9 @@ fn handle_offset_tool_interaction(
             if let Some((snapped_offset, segments)) = computed_preview {
                 offset_state.current_offset_distance = snapped_offset;
                 offset_state.preview_segments = segments;
+                if vcb.buffer.is_empty() {
+                    vcb.last_status = format!("Offset: {:+.2} m", snapped_offset);
+                }
             }
         }
         return;
@@ -2411,6 +2698,8 @@ fn detect_hovered_coplanar_contour(
     ray: Ray3d,
     cad_objects: &Query<(Entity, &CadObject)>,
 ) -> Option<(Entity, OffsetContour)> {
+    let vertex_resolved = resolve_vertex_parent_face_contour(ray, cad_objects);
+
     let mut best_block_t = f32::MAX;
     let mut best_block_contour: Option<(Entity, OffsetContour)> = None;
 
@@ -2445,6 +2734,13 @@ fn detect_hovered_coplanar_contour(
                     }
                 }
             }
+        }
+    }
+
+    if let Some((v_ent, v_contour, v_t)) = vertex_resolved {
+        let min_surface_t = best_block_t.min(best_line_t);
+        if v_t <= min_surface_t + VERTEX_SNAP_RADIUS {
+            return Some((v_ent, v_contour));
         }
     }
 
@@ -3311,7 +3607,11 @@ fn render_active_tool_gizmos(
 
         if let Some(contour) = base_contour {
             for (a, b) in contour.perimeter_segments_3d() {
-                gizmos.line(a, b, NEON_BLUE_SELECTION_COLOR);
+                gizmos.line(a, b, OFFSET_PREVIEW_COLOR);
+                gizmos.sphere(a, Quat::IDENTITY, 0.05_f32, OFFSET_PREVIEW_COLOR);
+            }
+            if let Some(snapped_v) = contour.snapped_vertex {
+                gizmos.sphere(snapped_v, Quat::IDENTITY, 0.11_f32, OFFSET_PREVIEW_COLOR);
             }
         }
 

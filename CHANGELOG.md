@@ -64,3 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Exact Raycast Face Selection for Offset Tool (`src/tools.rs`)**: Implemented `raycast_block_face_exact` with front-face normal culling (`ray_dir.dot(normal) < 0.0`) and 2D face-bounds testing so hovering over a 3D block deterministically locks `OffsetContour` onto the exact hit polygon normal and plane altitude (such as `Dir3::Z` at `max.z` for top covers) without falling back to synthetic line rectangles.
+
+## [0.1.5] — 2026-10-16
+
+### Fixed
+- **Vertex-to-Parent Face Resolution in Offset Tool (`src/tools.rs`)**: Added `collect_object_snap_vertices`, `resolve_block_face_sharing_vertex`, and `resolve_vertex_parent_face_contour` so hovering over or snapping to any mesh corner endpoint or edge midpoint within `VERTEX_SNAP_RADIUS` (`0.35m`) traces back to the parent `CadObject`, resolves the adjacent camera-facing horizontal or vertical polygonal face sharing that vertex, and highlights the entire resolved face perimeter and vertex snap marker in orange (`OFFSET_PREVIEW_COLOR`).
+- **Precision VCB Zero-Threshold Vertex Anchoring (`src/tools.rs`)**: Added `OffsetContour::with_vertex_zero_origin` and `drag_uv_zero_correction` to rebase the local 2D `(U, V)` coordinate origin directly onto the snapped vertex (`(0.0, 0.0)`), eliminating initial ray-offset jumps on `LMB` press and streaming live signed offset measurements relative to that vertex into the Measurements (VCB) box.
