@@ -85,3 +85,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Solid Manifold Sub-Face Push/Pull Extrusion (`src/commands.rs`, `src/tools.rs`)**: Rewrote `PushPullCommand` (`for_block_subface`) and `build_manifold_block_mesh_with_topology` to directly deform the parent block's vertex and index buffers when extruding or recessing a sub-face via mouse drag or VCB input, dynamically stitching interior cavity walls and exterior boss walls into a single watertight manifold mesh.
+
+## [0.1.8] - 2026-10-17
+
+### Fixed
+- **Dynamic Coplanar Topo-Graph Reconstruction for Offset Tool (`src/tools.rs`, `src/commands.rs`)**: Rewrote `detect_offset_contour_for_entity` to query the live, mutated Bevy `Mesh` vertex and index buffers (`extract_world_triangles_from_bevy_mesh`) via Möller–Trumbore ray-triangle intersection (`raycast_triangle_moller_trumbore`) rather than reading cached initial block bounds. Added a 2D directed half-edge boundary solver (`reconstruct_coplanar_outer_boundary_loop`) that filters connected coplanar triangles on the hit plane, cancels shared interior triangulation diagonals, and reconstructs the exact outermost boundary loop on extruded bosses, recessed pockets, and ledges.
+- **Scale-Awakened Local Basis & World-Space Manifold Face Soup (`src/commands.rs`, `src/tools.rs`)**: Applied full `Transform` (`translation`, `rotation`, and non-uniform `scale`) during live mesh triangle extraction and unified `EditableBlockTopology` around `ManifoldPolygonFace` entries so subsequent whole-face or sub-face extrusions never detach existing face subdivisions.

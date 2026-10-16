@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use bevy::math::primitives::{Cuboid, Cylinder, Sphere};
 use bevy::prelude::*;
-use bevy::render::mesh::{Indices, PrimitiveTopology};
+use bevy::render::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::render::render_asset::RenderAssetUsages;
 
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
@@ -130,111 +130,364 @@ impl SubFaceRegionKind {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SubdividedFaceSplit {
-    pub face_normal: Dir3,
-    pub base_outer_loop: [Vec3; 4],
-    pub base_inner_loop: [Vec3; 4],
-    pub inner_extrusion_depth: f32,
-    pub outer_frame_extrusion_depth: f32,
+pub struct ManifoldPolygonFace {
+    pub normal: Dir3,
+    pub outer_loop: [Vec3; 4],
+    pub inner_holes: Vec<[Vec3; 4]>,
 }
 
-impl SubdividedFaceSplit {
-    pub fn current_outer_loop_3d(&self) -> [Vec3; 4] {
-        let shift = self.face_normal.as_vec3() * self.outer_frame_extrusion_depth;
-        [
-            self.base_outer_loop[0] + shift,
-            self.base_outer_loop[1] + shift,
-            self.base_outer_loop[2] + shift,
-            self.base_outer_loop[3] + shift,
-        ]
-    }
-
-    pub fn current_frame_inner_rim_3d(&self) -> [Vec3; 4] {
-        let shift = self.face_normal.as_vec3() * self.outer_frame_extrusion_depth;
-        [
-            self.base_inner_loop[0] + shift,
-            self.base_inner_loop[1] + shift,
-            self.base_inner_loop[2] + shift,
-            self.base_inner_loop[3] + shift,
-        ]
-    }
-
-    pub fn current_inner_loop_3d(&self) -> [Vec3; 4] {
-        let shift = self.face_normal.as_vec3() * self.inner_extrusion_depth;
-        [
-            self.base_inner_loop[0] + shift,
-            self.base_inner_loop[1] + shift,
-            self.base_inner_loop[2] + shift,
-            self.base_inner_loop[3] + shift,
-        ]
+impl ManifoldPolygonFace {
+    pub fn plane_origin(&self) -> Vec3 {
+        (self.outer_loop[0] + self.outer_loop[1] + self.outer_loop[2] + self.outer_loop[3])
+            * 0.25_f32
     }
 
     pub fn translated(&self, delta: Vec3) -> Self {
         let mut moved = self.clone();
-        for v in &mut moved.base_outer_loop {
+        for v in &mut moved.outer_loop {
             *v += delta;
         }
-        for v in &mut moved.base_inner_loop {
-            *v += delta;
+        for hole in &mut moved.inner_holes {
+            for v in hole {
+                *v += delta;
+            }
         }
         moved
     }
 
     pub fn scaled_from_anchor(&self, anchor: Vec3, factors: Vec3) -> Self {
         let mut scaled = self.clone();
-        for v in &mut scaled.base_outer_loop {
+        for v in &mut scaled.outer_loop {
             *v = anchor + (*v - anchor) * factors;
         }
-        for v in &mut scaled.base_inner_loop {
-            *v = anchor + (*v - anchor) * factors;
+        for hole in &mut scaled.inner_holes {
+            for v in hole {
+                *v = anchor + (*v - anchor) * factors;
+            }
         }
-        let n = self.face_normal.as_vec3().abs();
-        let depth_scale = (n.x * factors.x + n.y * factors.y + n.z * factors.z).max(0.1_f32);
-        scaled.inner_extrusion_depth *= depth_scale;
-        scaled.outer_frame_extrusion_depth *= depth_scale;
         scaled
     }
 }
 
 #[derive(Component, Debug, Clone, Default, PartialEq)]
 pub struct EditableBlockTopology {
-    pub face_splits: Vec<SubdividedFaceSplit>,
+    pub faces: Vec<ManifoldPolygonFace>,
 }
 
 impl EditableBlockTopology {
-    pub fn find_split(&self, normal: Dir3) -> Option<&SubdividedFaceSplit> {
-        self.face_splits
-            .iter()
-            .find(|s| s.face_normal.as_vec3().dot(normal.as_vec3()) > 0.98_f32)
+    pub fn from_box(center: Vec3, size: Vec3) -> Self {
+        let clamped = size.max(Vec3::splat(0.05_f32));
+        let half = clamped * 0.5_f32;
+        let min = center - half;
+        let max = center + half;
+
+        let faces = vec![
+            ManifoldPolygonFace {
+                normal: Dir3::Z,
+                outer_loop: [
+                    Vec3::new(min.x, min.y, max.z),
+                    Vec3::new(max.x, min.y, max.z),
+                    Vec3::new(max.x, max.y, max.z),
+                    Vec3::new(min.x, max.y, max.z),
+                ],
+                inner_holes: Vec::new(),
+            },
+            ManifoldPolygonFace {
+                normal: Dir3::NEG_Z,
+                outer_loop: [
+                    Vec3::new(min.x, min.y, min.z),
+                    Vec3::new(min.x, max.y, min.z),
+                    Vec3::new(max.x, max.y, min.z),
+                    Vec3::new(max.x, min.y, min.z),
+                ],
+                inner_holes: Vec::new(),
+            },
+            ManifoldPolygonFace {
+                normal: Dir3::X,
+                outer_loop: [
+                    Vec3::new(max.x, min.y, min.z),
+                    Vec3::new(max.x, max.y, min.z),
+                    Vec3::new(max.x, max.y, max.z),
+                    Vec3::new(max.x, min.y, max.z),
+                ],
+                inner_holes: Vec::new(),
+            },
+            ManifoldPolygonFace {
+                normal: Dir3::NEG_X,
+                outer_loop: [
+                    Vec3::new(min.x, max.y, min.z),
+                    Vec3::new(min.x, min.y, min.z),
+                    Vec3::new(min.x, min.y, max.z),
+                    Vec3::new(min.x, max.y, max.z),
+                ],
+                inner_holes: Vec::new(),
+            },
+            ManifoldPolygonFace {
+                normal: Dir3::Y,
+                outer_loop: [
+                    Vec3::new(max.x, max.y, min.z),
+                    Vec3::new(min.x, max.y, min.z),
+                    Vec3::new(min.x, max.y, max.z),
+                    Vec3::new(max.x, max.y, max.z),
+                ],
+                inner_holes: Vec::new(),
+            },
+            ManifoldPolygonFace {
+                normal: Dir3::NEG_Y,
+                outer_loop: [
+                    Vec3::new(min.x, min.y, min.z),
+                    Vec3::new(max.x, min.y, min.z),
+                    Vec3::new(max.x, min.y, max.z),
+                    Vec3::new(min.x, min.y, max.z),
+                ],
+                inner_holes: Vec::new(),
+            },
+        ];
+
+        Self { faces }
     }
 
-    pub fn find_split_mut(&mut self, normal: Dir3) -> Option<&mut SubdividedFaceSplit> {
-        self.face_splits
-            .iter_mut()
-            .find(|s| s.face_normal.as_vec3().dot(normal.as_vec3()) > 0.98_f32)
-    }
-
-    pub fn upsert_split(&mut self, split: SubdividedFaceSplit) {
-        if let Some(existing) = self.find_split_mut(split.face_normal) {
-            *existing = split;
-        } else {
-            self.face_splits.push(split);
+    pub fn ensure_initialized(&mut self, center: Vec3, size: Vec3) {
+        if self.faces.is_empty() {
+            *self = Self::from_box(center, size);
         }
+    }
+
+    pub fn compute_bounds(&self) -> Option<(Vec3, Vec3)> {
+        if self.faces.is_empty() {
+            return None;
+        }
+        let mut min_pt = Vec3::splat(f32::MAX);
+        let mut max_pt = Vec3::splat(f32::MIN);
+        for face in &self.faces {
+            for v in &face.outer_loop {
+                min_pt = min_pt.min(*v);
+                max_pt = max_pt.max(*v);
+            }
+            for hole in &face.inner_holes {
+                for v in hole {
+                    min_pt = min_pt.min(*v);
+                    max_pt = max_pt.max(*v);
+                }
+            }
+        }
+        let size = (max_pt - min_pt).max(Vec3::splat(0.05_f32));
+        let center = (min_pt + max_pt) * 0.5_f32;
+        Some((center, size))
     }
 
     pub fn translated(&self, delta: Vec3) -> Self {
         Self {
-            face_splits: self.face_splits.iter().map(|s| s.translated(delta)).collect(),
+            faces: self.faces.iter().map(|f| f.translated(delta)).collect(),
         }
     }
 
     pub fn scaled_from_anchor(&self, anchor: Vec3, factors: Vec3) -> Self {
         Self {
-            face_splits: self
-                .face_splits
+            faces: self
+                .faces
                 .iter()
-                .map(|s| s.scaled_from_anchor(anchor, factors))
+                .map(|f| f.scaled_from_anchor(anchor, factors))
                 .collect(),
+        }
+    }
+
+    pub fn find_matching_face_index(
+        &self,
+        face_normal: Dir3,
+        target_loop: &[Vec3; 4],
+    ) -> Option<usize> {
+        let target_centroid =
+            (target_loop[0] + target_loop[1] + target_loop[2] + target_loop[3]) * 0.25_f32;
+        let n_vec = face_normal.as_vec3();
+
+        let mut best_idx: Option<usize> = None;
+        let mut best_score = f32::MAX;
+
+        for (idx, face) in self.faces.iter().enumerate() {
+            if face.normal.as_vec3().dot(n_vec) < 0.98_f32 {
+                continue;
+            }
+            let plane_dist = (face.plane_origin() - target_centroid).dot(n_vec).abs();
+            if plane_dist > 0.03_f32 {
+                continue;
+            }
+            let aligned = align_inner_loop_to_outer(&face.outer_loop, target_loop, n_vec);
+            let mut corner_err = 0.0_f32;
+            for k in 0..4 {
+                corner_err += face.outer_loop[k].distance(aligned[k]);
+            }
+            if corner_err < best_score {
+                best_score = corner_err;
+                best_idx = Some(idx);
+            }
+        }
+
+        if best_score <= 0.40_f32 {
+            best_idx
+        } else {
+            None
+        }
+    }
+
+    pub fn apply_offset_split(
+        &mut self,
+        face_normal: Dir3,
+        base_face_loop: [Vec3; 4],
+        offset_loop: [Vec3; 4],
+        signed_distance: f32,
+    ) {
+        let n_vec = face_normal.as_vec3();
+        let base_ccw = orient_loop_ccw(&base_face_loop, n_vec);
+        let offset_ccw = align_inner_loop_to_outer(&base_ccw, &offset_loop, n_vec);
+
+        if signed_distance <= 0.0_f32 {
+            if let Some(idx) = self.find_matching_face_index(face_normal, &base_ccw) {
+                self.faces[idx].inner_holes.push(offset_ccw);
+            } else {
+                self.faces.push(ManifoldPolygonFace {
+                    normal: face_normal,
+                    outer_loop: base_ccw,
+                    inner_holes: vec![offset_ccw],
+                });
+            }
+            self.faces.push(ManifoldPolygonFace {
+                normal: face_normal,
+                outer_loop: offset_ccw,
+                inner_holes: Vec::new(),
+            });
+        } else {
+            self.faces.push(ManifoldPolygonFace {
+                normal: face_normal,
+                outer_loop: offset_ccw,
+                inner_holes: vec![base_ccw],
+            });
+        }
+    }
+
+    pub fn extrude_face_region(
+        &mut self,
+        face_normal: Dir3,
+        target_outer_loop: [Vec3; 4],
+        region_kind: SubFaceRegionKind,
+        distance: f32,
+    ) {
+        if distance.abs() < 0.002_f32 {
+            return;
+        }
+        let n_vec = face_normal.as_vec3();
+        let shift = n_vec * distance;
+        let target_ccw = orient_loop_ccw(&target_outer_loop, n_vec);
+
+        let Some(face_idx) = self.find_matching_face_index(face_normal, &target_ccw) else {
+            return;
+        };
+
+        let old_outer = orient_loop_ccw(&self.faces[face_idx].outer_loop, n_vec);
+        let old_holes = self.faces[face_idx].inner_holes.clone();
+
+        // Check if old_outer is an inner hole of a coplanar surrounding frame face
+        let mut is_hole_of_coplanar_frame = false;
+        for (other_idx, other_face) in self.faces.iter().enumerate() {
+            if other_idx == face_idx {
+                continue;
+            }
+            if other_face.normal.as_vec3().dot(n_vec) > 0.98_f32 {
+                for hole in &other_face.inner_holes {
+                    let aligned_h = align_inner_loop_to_outer(&old_outer, hole, n_vec);
+                    let err: f32 = (0..4).map(|k| old_outer[k].distance(aligned_h[k])).sum();
+                    if err < 0.15_f32 {
+                        is_hole_of_coplanar_frame = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // If this is a pure unsplit WholeFace (not a hole inside a frame, and has no holes itself),
+        // check if we can cleanly slide shared vertices on perpendicular walls when no other splits touch them.
+        let total_splits_or_additions = self.faces.len() > 6
+            || !old_holes.is_empty()
+            || is_hole_of_coplanar_frame
+            || region_kind != SubFaceRegionKind::WholeFace;
+
+        if !total_splits_or_additions {
+            for face in &mut self.faces {
+                for v in &mut face.outer_loop {
+                    if old_outer.iter().any(| orig | orig.distance(*v) < 0.02_f32) {
+                        *v += shift;
+                    }
+                }
+            }
+            return;
+        }
+
+        // Move the target face's own outer loop and inner holes by +shift
+        for v in &mut self.faces[face_idx].outer_loop {
+            *v += shift;
+        }
+        for hole in &mut self.faces[face_idx].inner_holes {
+            for v in hole {
+                *v += shift;
+            }
+        }
+
+        // 1. Stitch 4 new side-wall faces along old_outer -> old_outer + shift
+        for k in 0..4 {
+            let next_k = (k + 1) % 4;
+            let b0 = old_outer[k];
+            let b1 = old_outer[next_k];
+            let t1 = b1 + shift;
+            let t0 = b0 + shift;
+
+            let edge_dir = (b1 - b0).normalize_or_zero();
+            let outward_ring_normal = edge_dir.cross(n_vec).normalize_or_zero();
+            let wall_normal_vec = if distance >= 0.0_f32 {
+                outward_ring_normal
+            } else {
+                -outward_ring_normal
+            };
+
+            if let Ok(wall_dir) = Dir3::new(wall_normal_vec) {
+                let wall_loop = orient_loop_ccw(&[b0, b1, t1, t0], wall_normal_vec);
+                self.faces.push(ManifoldPolygonFace {
+                    normal: wall_dir,
+                    outer_loop: wall_loop,
+                    inner_holes: Vec::new(),
+                });
+            }
+        }
+
+        // 2. For each hole in old_holes (e.g., when extruding an OuterFrame ring),
+        // stitch 4 inner step side-wall faces along hole -> hole + shift
+        for hole in old_holes {
+            let hole_ccw = orient_loop_ccw(&hole, n_vec);
+            for k in 0..4 {
+                let next_k = (k + 1) % 4;
+                let b0 = hole_ccw[k];
+                let b1 = hole_ccw[next_k];
+                let t1 = b1 + shift;
+                let t0 = b0 + shift;
+
+                let edge_dir = (b1 - b0).normalize_or_zero();
+                let outward_ring_normal = edge_dir.cross(n_vec).normalize_or_zero();
+                // For an inner hole of an extruded outer frame, the wall faces INWARD toward the hole center
+                // when distance > 0, and OUTWARD when distance < 0.
+                let wall_normal_vec = if distance >= 0.0_f32 {
+                    -outward_ring_normal
+                } else {
+                    outward_ring_normal
+                };
+
+                if let Ok(wall_dir) = Dir3::new(wall_normal_vec) {
+                    let wall_loop = orient_loop_ccw(&[b0, b1, t1, t0], wall_normal_vec);
+                    self.faces.push(ManifoldPolygonFace {
+                        normal: wall_dir,
+                        outer_loop: wall_loop,
+                        inner_holes: Vec::new(),
+                    });
+                }
+            }
         }
     }
 }
@@ -425,7 +678,7 @@ fn push_quad_ccw(
     ]);
 }
 
-fn orient_loop_ccw(loop_pts: &[Vec3; 4], normal: Vec3) -> [Vec3; 4] {
+pub fn orient_loop_ccw(loop_pts: &[Vec3; 4], normal: Vec3) -> [Vec3; 4] {
     let mut newell = Vec3::ZERO;
     for i in 0..4 {
         let curr = loop_pts[i];
@@ -441,7 +694,11 @@ fn orient_loop_ccw(loop_pts: &[Vec3; 4], normal: Vec3) -> [Vec3; 4] {
     }
 }
 
-fn align_inner_loop_to_outer(outer_ccw: &[Vec3; 4], inner_raw: &[Vec3; 4], normal: Vec3) -> [Vec3; 4] {
+pub fn align_inner_loop_to_outer(
+    outer_ccw: &[Vec3; 4],
+    inner_raw: &[Vec3; 4],
+    normal: Vec3,
+) -> [Vec3; 4] {
     let inner_ccw = orient_loop_ccw(inner_raw, normal);
     let mut best_shift = 0_usize;
     let mut best_dist = f32::MAX;
@@ -468,139 +725,38 @@ pub fn build_manifold_block_mesh_with_topology(
     size: Vec3,
     topology: &EditableBlockTopology,
 ) -> Mesh {
-    let clamped_size = size.max(Vec3::splat(0.05_f32));
-    let half = clamped_size * 0.5_f32;
-    let min = center - half;
-    let max = center + half;
-
-    let primary_faces: [(Dir3, [Vec3; 4]); 6] = [
-        (
-            Dir3::Z,
-            [
-                Vec3::new(min.x, min.y, max.z),
-                Vec3::new(max.x, min.y, max.z),
-                Vec3::new(max.x, max.y, max.z),
-                Vec3::new(min.x, max.y, max.z),
-            ],
-        ),
-        (
-            Dir3::NEG_Z,
-            [
-                Vec3::new(min.x, min.y, min.z),
-                Vec3::new(min.x, max.y, min.z),
-                Vec3::new(max.x, max.y, min.z),
-                Vec3::new(max.x, min.y, min.z),
-            ],
-        ),
-        (
-            Dir3::X,
-            [
-                Vec3::new(max.x, min.y, min.z),
-                Vec3::new(max.x, max.y, min.z),
-                Vec3::new(max.x, max.y, max.z),
-                Vec3::new(max.x, min.y, max.z),
-            ],
-        ),
-        (
-            Dir3::NEG_X,
-            [
-                Vec3::new(min.x, max.y, min.z),
-                Vec3::new(min.x, min.y, min.z),
-                Vec3::new(min.x, min.y, max.z),
-                Vec3::new(min.x, max.y, max.z),
-            ],
-        ),
-        (
-            Dir3::Y,
-            [
-                Vec3::new(max.x, max.y, min.z),
-                Vec3::new(min.x, max.y, min.z),
-                Vec3::new(min.x, max.y, max.z),
-                Vec3::new(max.x, max.y, max.z),
-            ],
-        ),
-        (
-            Dir3::NEG_Y,
-            [
-                Vec3::new(min.x, min.y, min.z),
-                Vec3::new(max.x, min.y, min.z),
-                Vec3::new(max.x, min.y, max.z),
-                Vec3::new(min.x, min.y, max.z),
-            ],
-        ),
-    ];
+    let fallback_topo;
+    let active_faces = if topology.faces.is_empty() {
+        fallback_topo = EditableBlockTopology::from_box(center, size);
+        &fallback_topo.faces
+    } else {
+        &topology.faces
+    };
 
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut uvs: Vec<[f32; 2]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
 
-    for (face_normal, default_verts) in primary_faces {
-        let n_vec = face_normal.as_vec3();
+    for face in active_faces {
+        let n_vec = face.normal.as_vec3();
+        let outer_ccw = orient_loop_ccw(&face.outer_loop, n_vec);
+        let outer_local: [Vec3; 4] = [
+            outer_ccw[0] - center,
+            outer_ccw[1] - center,
+            outer_ccw[2] - center,
+            outer_ccw[3] - center,
+        ];
 
-        if let Some(split) = topology.find_split(face_normal) {
-            let base_outer = orient_loop_ccw(&split.base_outer_loop, n_vec);
-            let base_inner = align_inner_loop_to_outer(&base_outer, &split.base_inner_loop, n_vec);
-
-            let d_outer = split.outer_frame_extrusion_depth;
-            let d_inner = split.inner_extrusion_depth;
-
-            let outer_local: [Vec3; 4] = [
-                base_outer[0] - center,
-                base_outer[1] - center,
-                base_outer[2] - center,
-                base_outer[3] - center,
-            ];
-            let disp_outer_local: [Vec3; 4] = [
-                outer_local[0] + n_vec * d_outer,
-                outer_local[1] + n_vec * d_outer,
-                outer_local[2] + n_vec * d_outer,
-                outer_local[3] + n_vec * d_outer,
-            ];
-            let frame_inner_local: [Vec3; 4] = [
-                (base_inner[0] - center) + n_vec * d_outer,
-                (base_inner[1] - center) + n_vec * d_outer,
-                (base_inner[2] - center) + n_vec * d_outer,
-                (base_inner[3] - center) + n_vec * d_outer,
-            ];
-            let disp_inner_local: [Vec3; 4] = [
-                (base_inner[0] - center) + n_vec * d_inner,
-                (base_inner[1] - center) + n_vec * d_inner,
-                (base_inner[2] - center) + n_vec * d_inner,
-                (base_inner[3] - center) + n_vec * d_inner,
+        if let Some(first_hole) = face.inner_holes.last() {
+            let hole_ccw = align_inner_loop_to_outer(&outer_ccw, first_hole, n_vec);
+            let hole_local: [Vec3; 4] = [
+                hole_ccw[0] - center,
+                hole_ccw[1] - center,
+                hole_ccw[2] - center,
+                hole_ccw[3] - center,
             ];
 
-            // 1. If the outer frame ring itself was extruded or recessed (d_outer != 0),
-            // stitch 4 exterior side-wall quads connecting the block's base rim to the displaced outer frame rim.
-            if d_outer.abs() > 0.002_f32 {
-                for k in 0..4 {
-                    let next_k = (k + 1) % 4;
-                    let b0 = outer_local[k];
-                    let b1 = outer_local[next_k];
-                    let t1 = disp_outer_local[next_k];
-                    let t0 = disp_outer_local[k];
-                    let edge_dir = (b1 - b0).normalize_or_zero();
-                    let wall_normal = if d_outer >= 0.0_f32 {
-                        edge_dir.cross(n_vec).normalize_or_zero()
-                    } else {
-                        -edge_dir.cross(n_vec).normalize_or_zero()
-                    };
-                    push_quad_ccw(
-                        &mut positions,
-                        &mut normals,
-                        &mut uvs,
-                        &mut indices,
-                        b0,
-                        b1,
-                        t1,
-                        t0,
-                        wall_normal,
-                    );
-                }
-            }
-
-            // 2. Triangulate the Outer Frame Ring into 4 trapezoid quads (8 triangles)
-            // connecting disp_outer_local[0..4] to frame_inner_local[0..4].
             for k in 0..4 {
                 let next_k = (k + 1) % 4;
                 push_quad_ccw(
@@ -608,77 +764,23 @@ pub fn build_manifold_block_mesh_with_topology(
                     &mut normals,
                     &mut uvs,
                     &mut indices,
-                    disp_outer_local[k],
-                    disp_outer_local[next_k],
-                    frame_inner_local[next_k],
-                    frame_inner_local[k],
+                    outer_local[k],
+                    outer_local[next_k],
+                    hole_local[next_k],
+                    hole_local[k],
                     n_vec,
                 );
             }
-
-            // 3. Stitch the 4 interior/exterior step side-walls (8 triangles) connecting
-            // frame_inner_local[0..4] (at d_outer) to disp_inner_local[0..4] (at d_inner).
-            let delta_depth = d_inner - d_outer;
-            if delta_depth.abs() > 0.002_f32 {
-                for k in 0..4 {
-                    let next_k = (k + 1) % 4;
-                    let r0 = frame_inner_local[k];
-                    let r1 = frame_inner_local[next_k];
-                    let c1 = disp_inner_local[next_k];
-                    let c0 = disp_inner_local[k];
-
-                    let edge_dir = (r1 - r0).normalize_or_zero();
-                    let outward_ring_normal = edge_dir.cross(n_vec).normalize_or_zero();
-                    // When delta_depth > 0 (inner sub-face protrudes outward as a boss),
-                    // the step walls face outward (+outward_ring_normal).
-                    // When delta_depth < 0 (inner sub-face is pushed inward as a recessed pocket),
-                    // the step walls face inward into the cavity (-outward_ring_normal).
-                    let step_wall_normal = if delta_depth >= 0.0_f32 {
-                        outward_ring_normal
-                    } else {
-                        -outward_ring_normal
-                    };
-
-                    push_quad_ccw(
-                        &mut positions,
-                        &mut normals,
-                        &mut uvs,
-                        &mut indices,
-                        r0,
-                        r1,
-                        c1,
-                        c0,
-                        step_wall_normal,
-                    );
-                }
-            }
-
-            // 4. Triangulate the Inner Sub-Face cap (2 triangles) at d_inner.
-            push_quad_ccw(
-                &mut positions,
-                &mut normals,
-                &mut uvs,
-                &mut indices,
-                disp_inner_local[0],
-                disp_inner_local[1],
-                disp_inner_local[2],
-                disp_inner_local[3],
-                n_vec,
-            );
         } else {
-            let v0 = default_verts[0] - center;
-            let v1 = default_verts[1] - center;
-            let v2 = default_verts[2] - center;
-            let v3 = default_verts[3] - center;
             push_quad_ccw(
                 &mut positions,
                 &mut normals,
                 &mut uvs,
                 &mut indices,
-                v0,
-                v1,
-                v2,
-                v3,
+                outer_local[0],
+                outer_local[1],
+                outer_local[2],
+                outer_local[3],
                 n_vec,
             );
         }
@@ -694,8 +796,73 @@ pub fn build_manifold_block_mesh_with_topology(
     .with_inserted_indices(Indices::U32(indices))
 }
 
+pub fn extract_world_triangles_from_bevy_mesh(
+    mesh: &Mesh,
+    transform: &Transform,
+) -> Vec<(Vec3, Vec3, Vec3, Vec3)> {
+    let Some(VertexAttributeValues::Float32x3(raw_positions)) =
+        mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+    else {
+        return Vec::new();
+    };
+
+    let world_verts: Vec<Vec3> = raw_positions
+        .iter()
+        .map(|p| transform.transform_point(Vec3::from_array(*p)))
+        .collect();
+
+    let mut tris = Vec::new();
+    match mesh.indices() {
+        Some(Indices::U32(idx_list)) => {
+            for chunk in idx_list.chunks_exact(3) {
+                let i0 = chunk[0] as usize;
+                let i1 = chunk[1] as usize;
+                let i2 = chunk[2] as usize;
+                if i0 < world_verts.len() && i1 < world_verts.len() && i2 < world_verts.len() {
+                    let a = world_verts[i0];
+                    let b = world_verts[i1];
+                    let c = world_verts[i2];
+                    let n = (b - a).cross(c - a).normalize_or_zero();
+                    if n.length_squared() > 0.5_f32 {
+                        tris.push((a, b, c, n));
+                    }
+                }
+            }
+        }
+        Some(Indices::U16(idx_list)) => {
+            for chunk in idx_list.chunks_exact(3) {
+                let i0 = chunk[0] as usize;
+                let i1 = chunk[1] as usize;
+                let i2 = chunk[2] as usize;
+                if i0 < world_verts.len() && i1 < world_verts.len() && i2 < world_verts.len() {
+                    let a = world_verts[i0];
+                    let b = world_verts[i1];
+                    let c = world_verts[i2];
+                    let n = (b - a).cross(c - a).normalize_or_zero();
+                    if n.length_squared() > 0.5_f32 {
+                        tris.push((a, b, c, n));
+                    }
+                }
+            }
+        }
+        None => {
+            for chunk in world_verts.chunks_exact(3) {
+                let a = chunk[0];
+                let b = chunk[1];
+                let c = chunk[2];
+                let n = (b - a).cross(c - a).normalize_or_zero();
+                if n.length_squared() > 0.5_f32 {
+                    tris.push((a, b, c, n));
+                }
+            }
+        }
+    }
+
+    tris
+}
+
 pub fn rebuild_block_entity_manifold_mesh(world: &mut World, target: Entity) {
-    let Some((center, size, topo)) = world.get_entity(target).and_then(|ent| {
+    let Some((mut center, mut size, mut topo)) = world.get_entity(target).and_then(|ent| {
         let obj = ent.get::<CadObject>()?;
         let CadGeometryKind::Block { center, size } = obj.geometry else {
             return None;
@@ -709,6 +876,12 @@ pub fn rebuild_block_entity_manifold_mesh(world: &mut World, target: Entity) {
         return;
     };
 
+    topo.ensure_initialized(center, size);
+    if let Some((bounds_center, bounds_size)) = topo.compute_bounds() {
+        center = bounds_center;
+        size = bounds_size;
+    }
+
     let new_mesh = build_manifold_block_mesh_with_topology(center, size, &topo);
     let new_mesh_handle = {
         let mut meshes = world.resource_mut::<Assets<Mesh>>();
@@ -716,6 +889,10 @@ pub fn rebuild_block_entity_manifold_mesh(world: &mut World, target: Entity) {
     };
 
     if let Some(mut ent_mut) = world.get_entity_mut(target) {
+        if let Some(mut obj) = ent_mut.get_mut::<CadObject>() {
+            obj.geometry = CadGeometryKind::Block { center, size };
+        }
+        ent_mut.insert(topo);
         if let Some(mut tf) = ent_mut.get_mut::<Transform>() {
             tf.translation = center;
             tf.rotation = Quat::IDENTITY;
@@ -728,13 +905,17 @@ pub fn rebuild_block_entity_manifold_mesh(world: &mut World, target: Entity) {
 }
 
 pub fn instantiate_cad_entity(world: &mut World, cad_obj: CadObject) -> Entity {
-    instantiate_cad_entity_with_topology(world, cad_obj, EditableBlockTopology::default())
+    let topo = match cad_obj.geometry {
+        CadGeometryKind::Block { center, size } => EditableBlockTopology::from_box(center, size),
+        CadGeometryKind::Line { .. } => EditableBlockTopology::default(),
+    };
+    instantiate_cad_entity_with_topology(world, cad_obj, topo)
 }
 
 pub fn instantiate_cad_entity_with_topology(
     world: &mut World,
     cad_obj: CadObject,
-    topology: EditableBlockTopology,
+    mut topology: EditableBlockTopology,
 ) -> Entity {
     match cad_obj.geometry {
         CadGeometryKind::Line { start, end, radius } => {
@@ -801,6 +982,7 @@ pub fn instantiate_cad_entity_with_topology(
         }
         CadGeometryKind::Block { center, size } => {
             let clamped = size.max(Vec3::splat(0.05_f32));
+            topology.ensure_initialized(center, clamped);
             let built_mesh = build_manifold_block_mesh_with_topology(center, clamped, &topology);
             let (box_mesh, box_mat) = {
                 let mut meshes = world.resource_mut::<Assets<Mesh>>();
@@ -1044,7 +1226,10 @@ impl Command for CreateBlockCommand {
 
 pub struct CreateOffsetCommand {
     target_block_entity: Option<Entity>,
-    face_split: Option<SubdividedFaceSplit>,
+    face_normal: Option<Dir3>,
+    base_face_vertices: Option<[Vec3; 4]>,
+    offset_vertices: Option<[Vec3; 4]>,
+    signed_distance: f32,
     previous_topology: Option<EditableBlockTopology>,
     fallback_segments: Vec<(Vec3, Vec3)>,
     color: Color,
@@ -1062,23 +1247,12 @@ impl CreateOffsetCommand {
         color: Color,
         group_id: Option<GroupId>,
     ) -> Self {
-        let (base_outer_loop, base_inner_loop) = if signed_distance <= 0.0_f32 {
-            (base_face_vertices, offset_vertices)
-        } else {
-            (offset_vertices, base_face_vertices)
-        };
-
-        let split = SubdividedFaceSplit {
-            face_normal,
-            base_outer_loop,
-            base_inner_loop,
-            inner_extrusion_depth: 0.0_f32,
-            outer_frame_extrusion_depth: 0.0_f32,
-        };
-
         Self {
             target_block_entity: Some(parent_entity),
-            face_split: Some(split),
+            face_normal: Some(face_normal),
+            base_face_vertices: Some(base_face_vertices),
+            offset_vertices: Some(offset_vertices),
+            signed_distance,
             previous_topology: None,
             fallback_segments: Vec::new(),
             color,
@@ -1094,7 +1268,10 @@ impl CreateOffsetCommand {
     ) -> Self {
         Self {
             target_block_entity: None,
-            face_split: None,
+            face_normal: None,
+            base_face_vertices: None,
+            offset_vertices: None,
+            signed_distance: 0.0_f32,
             previous_topology: None,
             fallback_segments: segments,
             color,
@@ -1106,17 +1283,29 @@ impl CreateOffsetCommand {
 
 impl Command for CreateOffsetCommand {
     fn execute(&mut self, world: &mut World) {
-        if let (Some(parent_entity), Some(split)) =
-            (self.target_block_entity, self.face_split.clone())
-        {
-            let existing_topo = world
+        if let (Some(parent_entity), Some(normal), Some(base_v4), Some(offset_v4)) = (
+            self.target_block_entity,
+            self.face_normal,
+            self.base_face_vertices,
+            self.offset_vertices,
+        ) {
+            let (center, size) = world
+                .get::<CadObject>(parent_entity)
+                .and_then(|o| match o.geometry {
+                    CadGeometryKind::Block { center, size } => Some((center, size)),
+                    CadGeometryKind::Line { .. } => None,
+                })
+                .unwrap_or((Vec3::ZERO, Vec3::ONE));
+
+            let mut existing_topo = world
                 .get::<EditableBlockTopology>(parent_entity)
                 .cloned()
                 .unwrap_or_default();
+            existing_topo.ensure_initialized(center, size);
             self.previous_topology = Some(existing_topo.clone());
 
             let mut updated_topo = existing_topo;
-            updated_topo.upsert_split(split);
+            updated_topo.apply_offset_split(normal, base_v4, offset_v4, self.signed_distance);
 
             if let Some(mut ent_mut) = world.get_entity_mut(parent_entity) {
                 ent_mut.insert(updated_topo);
@@ -1432,7 +1621,7 @@ impl Command for PushPullCommand {
                     },
                     cad_obj.material_color,
                     cad_obj,
-                    EditableBlockTopology::default(),
+                    EditableBlockTopology::from_box(solid_center, solid_size),
                 ))
                 .id();
 
@@ -1561,7 +1750,10 @@ impl Command for ScaleObjectCommand {
                         s1.y / s0.y.max(0.05_f32),
                         s1.z / s0.z.max(0.05_f32),
                     );
-                    let shifted = topo.translated(-c0).scaled_from_anchor(Vec3::ZERO, factors).translated(c1);
+                    let shifted = topo
+                        .translated(-c0)
+                        .scaled_from_anchor(Vec3::ZERO, factors)
+                        .translated(c1);
                     self.after_topology = Some(shifted);
                     self.before_topology = Some(topo);
                 }

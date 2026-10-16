@@ -6,10 +6,10 @@ use bevy::window::PrimaryWindow;
 use bevy_egui::EguiContexts;
 
 use crate::commands::{
-    build_manifold_block_mesh_with_topology, CadGeometryKind, CadObject, CommandHistory,
-    CreateBlockCommand, CreateOffsetCommand, DeleteCommand, DrawLineCommand,
-    EditableBlockTopology, GroupId, MaterialColor, MoveObjectCommand, PushPullCommand,
-    ScaleObjectCommand, SubFaceRegionKind, SubdividedFaceSplit,
+    build_manifold_block_mesh_with_topology, extract_world_triangles_from_bevy_mesh,
+    CadGeometryKind, CadObject, CommandHistory, CreateBlockCommand, CreateOffsetCommand,
+    DeleteCommand, DrawLineCommand, EditableBlockTopology, GroupId, ManifoldPolygonFace,
+    MaterialColor, MoveObjectCommand, PushPullCommand, ScaleObjectCommand, SubFaceRegionKind,
 };
 
 pub const AXIS_RED_COLOR: Color = Color::srgb(0.92, 0.20, 0.22);
@@ -2500,7 +2500,387 @@ fn enumerate_block_faces(
     ]
 }
 
-fn collect_object_snap_vertices(obj: &CadObject) -> Vec<Vec3> {
+fn raycast_triangle_moller_trumbore(
+    ray: Ray3d,
+    v0: Vec3,
+    v1: Vec3,
+    v2: Vec3,
+) -> Option<f32> {
+    let edge1 = v1 - v0;
+    let edge2 = v2 - v0;
+    let dir = ray.direction.as_vec3();
+    let h = dir.cross(edge2);
+    let a = edge1.dot(h);
+    if a.abs() < 1e-7_f32 {
+        return None;
+    }
+    let f = 1.0_f32 / a;
+    let s = ray.origin - v0;
+    let u = f * s.dot(h);
+    if !(0.0_f32..=1.0_f32).contains(&u) {
+        return None;
+    }
+    let q = s.cross(edge1);
+    let v = f * dir.dot(q);
+    if v < 0.0_f32 || u + v > 1.0_f32 {
+        return None;
+    }
+    let t = f * edge2.dot(q);
+    if t > 0.001_f32 {
+        Some(t)
+    } else {
+        None
+    }
+}
+
+fn quantize_uv_key(uv: Vec2) -> (i64, i64) {
+    let scale = 1000.0_f32;
+    ((uv.x * scale).round() as i64, (uv.y * scale).round() as i64)
+}
+
+fn simplify_collinear_polygon_2d(loop_uv: &[Vec2]) -> Vec<Vec2> {
+    let n = loop_uv.len();
+    if n <= 3 {
+        return loop_uv.to_vec();
+    }
+    let mut simplified = Vec::with_capacity(n);
+    for i in 0..n {
+        let prev = loop_uv[(i + n - 1) % n];
+        let curr = loop_uv[i];
+        let next = loop_uv[(i + 1) % n];
+        let d1 = (curr - prev).normalize_or_zero();
+        let d2 = (next - curr).normalize_or_zero();
+        if d1.dot(d2) < 0.9992_f32 {
+            simplified.push(curr);
+        }
+    }
+    if simplified.len() >= 3 {
+        simplified
+    } else {
+        loop_uv.to_vec()
+    }
+}
+
+pub fn reconstruct_coplanar_outer_boundary_loop(
+    coplanar_triangles: &[(Vec3, Vec3, Vec3)],
+    plane_origin: Vec3,
+    plane_normal: Dir3,
+    group_id: Option<GroupId>,
+) -> Option<OffsetContour> {
+    if coplanar_triangles.is_empty() {
+        return None;
+    }
+
+    let n_vec = plane_normal.as_vec3();
+    let (tangent_u, bitangent_v) = build_orthonormal_uv_basis(n_vec);
+
+    let project_uv = |pt: Vec3| -> Vec2 {
+        let rel = pt - plane_origin;
+        Vec2::new(rel.dot(tangent_u), rel.dot(bitangent_v))
+    };
+
+    let mut key_to_uv: std::collections::HashMap<(i64, i64), Vec2> =
+        std::collections::HashMap::new();
+    let mut directed_edges: Vec<((i64, i64), (i64, i64))> =
+        Vec::with_capacity(coplanar_triangles.len() * 3);
+
+    for (a, b, c) in coplanar_triangles {
+        let mut ua = project_uv(*a);
+        let mut ub = project_uv(*b);
+        let mut uc = project_uv(*c);
+
+        let area_2x = (ub.x - ua.x) * (uc.y - ua.y) - (ub.y - ua.y) * (uc.x - ua.x);
+        if area_2x.abs() < 1e-6_f32 {
+            continue;
+        }
+        if area_2x < 0.0_f32 {
+            std::mem::swap(&mut ub, &mut uc);
+        }
+
+        let ka = quantize_uv_key(ua);
+        let kb = quantize_uv_key(ub);
+        let kc = quantize_uv_key(uc);
+
+        key_to_uv.entry(ka).or_insert(ua);
+        key_to_uv.entry(kb).or_insert(ub);
+        key_to_uv.entry(kc).or_insert(uc);
+
+        if ka != kb {
+            directed_edges.push((ka, kb));
+        }
+        if kb != kc {
+            directed_edges.push((kb, kc));
+        }
+        if kc != ka {
+            directed_edges.push((kc, ka));
+        }
+    }
+
+    let mut edge_set: std::collections::HashSet<((i64, i64), (i64, i64))> =
+        std::collections::HashSet::with_capacity(directed_edges.len());
+    for e in &directed_edges {
+        edge_set.insert(*e);
+    }
+
+    // Cancel all interior shared twin half-edges (u -> v where v -> u also exists)
+    let mut boundary_edges: Vec<((i64, i64), (i64, i64))> = Vec::new();
+    for &(u, v) in &directed_edges {
+        if !edge_set.contains(&(v, u)) {
+            boundary_edges.push((u, v));
+        }
+    }
+
+    if boundary_edges.len() < 3 {
+        return None;
+    }
+
+    let mut used = vec![false; boundary_edges.len()];
+    let mut best_loop_uv: Option<Vec<Vec2>> = None;
+    let mut best_abs_area = 0.0_f32;
+
+    for start_idx in 0..boundary_edges.len() {
+        if used[start_idx] {
+            continue;
+        }
+        used[start_idx] = true;
+        let (seed_u, mut curr_v) = boundary_edges[start_idx];
+        let mut chain_keys = vec![seed_u, curr_v];
+
+        for _ in 0..boundary_edges.len() {
+            if curr_v == seed_u {
+                break;
+            }
+            let mut found_next = None;
+            for (idx, &(u, v)) in boundary_edges.iter().enumerate() {
+                if !used[idx] && u == curr_v {
+                    used[idx] = true;
+                    found_next = Some(v);
+                    break;
+                }
+            }
+            if let Some(next_k) = found_next {
+                curr_v = next_k;
+                if curr_v != seed_u {
+                    chain_keys.push(curr_v);
+                }
+            } else {
+                break;
+            }
+        }
+
+        if curr_v == seed_u && chain_keys.len() >= 3 {
+            let raw_uv: Vec<Vec2> = chain_keys
+                .iter()
+                .filter_map(|k| key_to_uv.get(k).copied())
+                .collect();
+            let simplified_uv = simplify_collinear_polygon_2d(&raw_uv);
+            if simplified_uv.len() >= 3 {
+                let area = compute_polygon_signed_area_2x(&simplified_uv).abs();
+                if area > best_abs_area {
+                    best_abs_area = area;
+                    best_loop_uv = Some(simplified_uv);
+                }
+            }
+        }
+    }
+
+    let outer_uv = best_loop_uv?;
+    let world_loop: Vec<Vec3> = outer_uv
+        .iter()
+        .map(|uv| plane_origin + tangent_u * uv.x + bitangent_v * uv.y)
+        .collect();
+
+    OffsetContour::from_coplanar_loop_3d_with_origin(
+        &world_loop,
+        plane_origin,
+        plane_normal,
+        group_id,
+    )
+}
+
+pub fn detect_offset_contour_for_entity(
+    ray: Ray3d,
+    entity: Entity,
+    obj: &CadObject,
+    transform: &Transform,
+    mesh: Option<&Mesh>,
+    topology: Option<&EditableBlockTopology>,
+    all_line_segments: &[(Vec3, Vec3)],
+) -> Option<(f32, OffsetContour)> {
+    match obj.geometry {
+        CadGeometryKind::Block { center, size } => {
+            // 1. First check if the entity has a live Bevy Mesh and raycast its actual transformed triangles
+            if let Some(bevy_mesh) = mesh {
+                let tris = extract_world_triangles_from_bevy_mesh(bevy_mesh, transform);
+                let ray_dir = ray.direction.as_vec3();
+
+                let mut closest_t = f32::MAX;
+                let mut hit_tri_idx: Option<usize> = None;
+
+                for (idx, (a, b, c, n)) in tris.iter().enumerate() {
+                    if ray_dir.dot(*n) >= -1e-6_f32 {
+                        continue;
+                    }
+                    if let Some(t) = raycast_triangle_moller_trumbore(ray, *a, *b, *c) {
+                        if t < closest_t {
+                            closest_t = t;
+                            hit_tri_idx = Some(idx);
+                        }
+                    }
+                }
+
+                if let Some(seed_idx) = hit_tri_idx {
+                    let hit_point = ray.get_point(closest_t);
+                    let seed_normal_vec = tris[seed_idx].3;
+                    if let Ok(hit_normal) = Dir3::new(seed_normal_vec) {
+                        // If EditableBlockTopology has an exact sub-face (e.g. InnerLoop vs OuterFrame on the same plane),
+                        // check if the hit point lands directly inside a specific ManifoldPolygonFace without holes first.
+                        if let Some(topo) = topology {
+                            let scale_aware_tf = *transform;
+                            let is_unit_scale =
+                                (scale_aware_tf.scale - Vec3::ONE).length() < 0.005_f32;
+                            if is_unit_scale {
+                                for face in &topo.faces {
+                                    if face.normal.as_vec3().dot(seed_normal_vec) > 0.99_f32
+                                        && face.inner_holes.is_empty()
+                                    {
+                                        if let Some(c) = OffsetContour::from_coplanar_loop_3d(
+                                            &face.outer_loop,
+                                            Some(face.normal),
+                                            obj.group_id,
+                                        ) {
+                                            let plane_dist = (hit_point - c.plane_origin)
+                                                .dot(seed_normal_vec)
+                                                .abs();
+                                            if plane_dist <= 0.008_f32 {
+                                                let uv = c.project_world_to_uv(hit_point);
+                                                if is_point_inside_polygon_2d(uv, &c.vertices_uv) {
+                                                    return Some((closest_t, c));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Filter all triangles in the live Mesh that lie strictly on the same 3D infinite plane
+                        let plane_tol = 0.006_f32;
+                        let mut coplanar_indices: Vec<usize> = Vec::new();
+                        for (idx, (a, b, c, n)) in tris.iter().enumerate() {
+                            if n.dot(seed_normal_vec) < 0.992_f32 {
+                                continue;
+                            }
+                            let da = (*a - hit_point).dot(seed_normal_vec).abs();
+                            let db = (*b - hit_point).dot(seed_normal_vec).abs();
+                            let dc = (*c - hit_point).dot(seed_normal_vec).abs();
+                            if da <= plane_tol && db <= plane_tol && dc <= plane_tol {
+                                coplanar_indices.push(idx);
+                            }
+                        }
+
+                        // Flood-fill connected coplanar triangles starting from seed_idx
+                        let quant3 = |p: Vec3| -> (i64, i64, i64) {
+                            (
+                                (p.x * 500.0_f32).round() as i64,
+                                (p.y * 500.0_f32).round() as i64,
+                                (p.z * 500.0_f32).round() as i64,
+                            )
+                        };
+
+                        let mut connected_tris: Vec<(Vec3, Vec3, Vec3)> = Vec::new();
+                        let mut visited = vec![false; coplanar_indices.len()];
+                        let mut active_verts: std::collections::HashSet<(i64, i64, i64)> =
+                            std::collections::HashSet::new();
+
+                        let (sa, sb, sc, _) = tris[seed_idx];
+                        active_verts.insert(quant3(sa));
+                        active_verts.insert(quant3(sb));
+                        active_verts.insert(quant3(sc));
+
+                        loop {
+                            let mut added_any = false;
+                            for (pos, &tri_i) in coplanar_indices.iter().enumerate() {
+                                if visited[pos] {
+                                    continue;
+                                }
+                                let (a, b, c, _) = tris[tri_i];
+                                let ka = quant3(a);
+                                let kb = quant3(b);
+                                let kc = quant3(c);
+                                let shared_count = usize::from(active_verts.contains(&ka))
+                                    + usize::from(active_verts.contains(&kb))
+                                    + usize::from(active_verts.contains(&kc));
+                                if shared_count >= 2 || tri_i == seed_idx {
+                                    visited[pos] = true;
+                                    active_verts.insert(ka);
+                                    active_verts.insert(kb);
+                                    active_verts.insert(kc);
+                                    connected_tris.push((a, b, c));
+                                    added_any = true;
+                                }
+                            }
+                            if !added_any {
+                                break;
+                            }
+                        }
+
+                        if let Some(contour) = reconstruct_coplanar_outer_boundary_loop(
+                            &connected_tris,
+                            hit_point,
+                            hit_normal,
+                            obj.group_id,
+                        ) {
+                            return Some((closest_t, contour));
+                        }
+                    }
+                }
+            }
+
+            // Fallback to analytical box face raycast if Mesh asset is not yet ready
+            let scaled_size = size * transform.scale.abs();
+            if let Some(face_hit) = raycast_block_face_exact(ray, transform.translation, scaled_size)
+            {
+                let contour = OffsetContour::from_block_face_hit(&face_hit, obj.group_id)?;
+                return Some((face_hit.t, contour));
+            }
+            let _ = entity;
+            None
+        }
+        CadGeometryKind::Line { start, end, radius } => {
+            let pick_radius = (radius * 2.5_f32).max(0.18_f32);
+            let t = ray_intersects_segment_capsule(ray, start, end, pick_radius)?;
+            let ordered_loop =
+                assemble_closed_loop_from_segments(start, end, all_line_segments)?;
+            let contour =
+                OffsetContour::from_coplanar_loop_3d(&ordered_loop, None, obj.group_id)?;
+            Some((t, contour))
+        }
+    }
+}
+
+fn collect_object_snap_vertices_world(
+    obj: &CadObject,
+    transform: &Transform,
+    mesh: Option<&Mesh>,
+) -> Vec<Vec3> {
+    if let Some(bevy_mesh) = mesh {
+        if matches!(obj.geometry, CadGeometryKind::Block { .. }) {
+            let tris = extract_world_triangles_from_bevy_mesh(bevy_mesh, transform);
+            let mut unique: Vec<Vec3> = Vec::new();
+            for (a, b, c, _) in tris {
+                for v in [a, b, c, (a + b) * 0.5_f32, (b + c) * 0.5_f32, (c + a) * 0.5_f32] {
+                    if !unique.iter().any(|u| u.distance(v) < 0.01_f32) {
+                        unique.push(v);
+                    }
+                }
+            }
+            if !unique.is_empty() {
+                return unique;
+            }
+        }
+    }
+
     match obj.geometry {
         CadGeometryKind::Line { start, end, .. } => {
             vec![start, end, (start + end) * 0.5_f32]
@@ -2518,71 +2898,14 @@ fn collect_object_snap_vertices(obj: &CadObject) -> Vec<Vec3> {
     }
 }
 
-fn resolve_block_face_sharing_vertex(
-    ray: Ray3d,
-    center: Vec3,
-    size: Vec3,
-    vertex_3d: Vec3,
-    group_id: Option<GroupId>,
-) -> Option<OffsetContour> {
-    let plane_tol = 0.03_f32;
-
-    if let Some(direct_hit) = raycast_block_face_exact(ray, center, size) {
-        let dist_to_plane = (vertex_3d - direct_hit.plane_origin)
-            .dot(direct_hit.normal.as_vec3())
-            .abs();
-        if dist_to_plane <= plane_tol {
-            if let Some(contour) = OffsetContour::from_block_face_hit(&direct_hit, group_id) {
-                return Some(contour.with_vertex_zero_origin(vertex_3d));
-            }
-        }
-    }
-
-    let ray_dir = ray.direction.as_vec3();
-    let faces = enumerate_block_faces(center, size);
-    let mut best_score = f32::NEG_INFINITY;
-    let mut best_face: Option<BlockFaceHit> = None;
-
-    for (normal, plane_origin, u_axis, v_axis, half_u, half_v, vertices) in faces {
-        let normal_vec = normal.as_vec3();
-        let plane_dist = (vertex_3d - plane_origin).dot(normal_vec).abs();
-        if plane_dist > plane_tol {
-            continue;
-        }
-        let rel = vertex_3d - plane_origin;
-        let u_dist = rel.dot(u_axis).abs();
-        let v_dist = rel.dot(v_axis).abs();
-        if u_dist > half_u + plane_tol || v_dist > half_v + plane_tol {
-            continue;
-        }
-
-        let facing = -ray_dir.dot(normal_vec);
-        let horiz_bonus = if normal_vec.z > 0.9_f32 && facing > 0.05_f32 {
-            0.25_f32
-        } else {
-            0.0_f32
-        };
-        let score = facing + horiz_bonus;
-        if score > best_score {
-            best_score = score;
-            best_face = Some(BlockFaceHit {
-                t: ray.origin.distance(vertex_3d),
-                hit_point: vertex_3d,
-                plane_origin,
-                normal,
-                vertices,
-            });
-        }
-    }
-
-    let resolved = best_face?;
-    let contour = OffsetContour::from_block_face_hit(&resolved, group_id)?;
-    Some(contour.with_vertex_zero_origin(vertex_3d))
-}
-
 fn resolve_vertex_parent_face_contour(
     ray: Ray3d,
     cad_objects: &Query<(Entity, &CadObject)>,
+    transforms: &Query<&Transform>,
+    mesh_handles: &Query<&Handle<Mesh>>,
+    topologies: &Query<&EditableBlockTopology>,
+    meshes: &Assets<Mesh>,
+    all_lines: &[(Vec3, Vec3)],
 ) -> Option<(Entity, OffsetContour, f32)> {
     let mut closest_vertex_t = f32::MAX;
     let mut matched_entity: Option<Entity> = None;
@@ -2590,7 +2913,9 @@ fn resolve_vertex_parent_face_contour(
     let mut snapped_vertex_3d = Vec3::ZERO;
 
     for (entity, obj) in cad_objects.iter() {
-        for v_pt in collect_object_snap_vertices(obj) {
+        let tf = transforms.get(entity).copied().unwrap_or_default();
+        let mesh_opt = mesh_handles.get(entity).ok().and_then(|h| meshes.get(h));
+        for v_pt in collect_object_snap_vertices_world(obj, &tf, mesh_opt) {
             if let Some(t) = ray_intersects_sphere(ray, v_pt, VERTEX_SNAP_RADIUS) {
                 if t < closest_vertex_t {
                     closest_vertex_t = t;
@@ -2604,46 +2929,150 @@ fn resolve_vertex_parent_face_contour(
 
     let parent_ent = matched_entity?;
     let parent_obj = matched_obj?;
+    let tf = transforms.get(parent_ent).copied().unwrap_or_default();
+    let mesh_opt = mesh_handles
+        .get(parent_ent)
+        .ok()
+        .and_then(|h| meshes.get(h));
+    let topo_opt = topologies.get(parent_ent).ok();
 
-    match parent_obj.geometry {
-        CadGeometryKind::Block { center, size } => {
-            let contour = resolve_block_face_sharing_vertex(
-                ray,
-                center,
-                size,
-                snapped_vertex_3d,
-                parent_obj.group_id,
-            )?;
-            Some((parent_ent, contour, closest_vertex_t))
+    if let Some((_t, direct_contour)) = detect_offset_contour_for_entity(
+        ray,
+        parent_ent,
+        &parent_obj,
+        &tf,
+        mesh_opt,
+        topo_opt,
+        all_lines,
+    ) {
+        let dist_to_plane = (snapped_vertex_3d - direct_contour.plane_origin)
+            .dot(direct_contour.plane_normal.as_vec3())
+            .abs();
+        if dist_to_plane <= 0.04_f32 {
+            return Some((
+                parent_ent,
+                direct_contour.with_vertex_zero_origin(snapped_vertex_3d),
+                closest_vertex_t,
+            ));
         }
-        CadGeometryKind::Line { start, end, .. } => {
-            if let Some(contour) =
-                detect_closed_line_loop_contour(start, end, parent_obj.group_id, cad_objects)
-            {
+    }
+
+    if let Some(bevy_mesh) = mesh_opt {
+        let tris = extract_world_triangles_from_bevy_mesh(bevy_mesh, &tf);
+        let ray_dir = ray.direction.as_vec3();
+        let mut best_score = f32::NEG_INFINITY;
+        let mut best_normal: Option<Dir3> = None;
+
+        for (a, b, c, n) in &tris {
+            let touches = a.distance(snapped_vertex_3d) < 0.03_f32
+                || b.distance(snapped_vertex_3d) < 0.03_f32
+                || c.distance(snapped_vertex_3d) < 0.03_f32
+                || ((*a + *b) * 0.5_f32).distance(snapped_vertex_3d) < 0.03_f32
+                || ((*b + *c) * 0.5_f32).distance(snapped_vertex_3d) < 0.03_f32
+                || ((*c + *a) * 0.5_f32).distance(snapped_vertex_3d) < 0.03_f32;
+            if !touches {
+                continue;
+            }
+            let facing = -ray_dir.dot(*n);
+            if facing <= 0.01_f32 {
+                continue;
+            }
+            let horiz_bonus = if n.z > 0.9_f32 { 0.20_f32 } else { 0.0_f32 };
+            let score = facing + horiz_bonus;
+            if score > best_score {
+                best_score = score;
+                best_normal = Dir3::new(*n).ok();
+            }
+        }
+
+        if let Some(chosen_normal) = best_normal {
+            let n_vec = chosen_normal.as_vec3();
+            let coplanar_tris: Vec<(Vec3, Vec3, Vec3)> = tris
+                .into_iter()
+                .filter(|(a, b, c, n)| {
+                    n.dot(n_vec) > 0.992_f32
+                        && (*a - snapped_vertex_3d).dot(n_vec).abs() <= 0.008_f32
+                        && (*b - snapped_vertex_3d).dot(n_vec).abs() <= 0.008_f32
+                        && (*c - snapped_vertex_3d).dot(n_vec).abs() <= 0.008_f32
+                })
+                .map(|(a, b, c, _)| (a, b, c))
+                .collect();
+
+            if let Some(contour) = reconstruct_coplanar_outer_boundary_loop(
+                &coplanar_tris,
+                snapped_vertex_3d,
+                chosen_normal,
+                parent_obj.group_id,
+            ) {
                 return Some((
                     parent_ent,
                     contour.with_vertex_zero_origin(snapped_vertex_3d),
                     closest_vertex_t,
                 ));
             }
-
-            for (block_ent, block_obj) in cad_objects.iter() {
-                if let CadGeometryKind::Block { center, size } = block_obj.geometry {
-                    if let Some(contour) = resolve_block_face_sharing_vertex(
-                        ray,
-                        center,
-                        size,
-                        snapped_vertex_3d,
-                        block_obj.group_id,
-                    ) {
-                        return Some((block_ent, contour, closest_vertex_t));
-                    }
-                }
-            }
-
-            None
         }
     }
+
+    None
+}
+
+fn detect_hovered_coplanar_contour(
+    ray: Ray3d,
+    cad_objects: &Query<(Entity, &CadObject)>,
+    transforms: &Query<&Transform>,
+    mesh_handles: &Query<&Handle<Mesh>>,
+    topologies: &Query<&EditableBlockTopology>,
+    meshes: &Assets<Mesh>,
+) -> Option<(Entity, OffsetContour)> {
+    let all_lines: Vec<(Vec3, Vec3)> = cad_objects
+        .iter()
+        .filter_map(|(_, o)| match o.geometry {
+            CadGeometryKind::Line { start, end, .. } => Some((start, end)),
+            CadGeometryKind::Block { .. } => None,
+        })
+        .collect();
+
+    let vertex_resolved = resolve_vertex_parent_face_contour(
+        ray,
+        cad_objects,
+        transforms,
+        mesh_handles,
+        topologies,
+        meshes,
+        &all_lines,
+    );
+
+    let mut best_surface_t = f32::MAX;
+    let mut best_surface_contour: Option<(Entity, OffsetContour)> = None;
+
+    for (entity, obj) in cad_objects.iter() {
+        let tf = transforms.get(entity).copied().unwrap_or_default();
+        let mesh_opt = mesh_handles.get(entity).ok().and_then(|h| meshes.get(h));
+        let topo_opt = topologies.get(entity).ok();
+
+        if let Some((t, contour)) = detect_offset_contour_for_entity(
+            ray,
+            entity,
+            obj,
+            &tf,
+            mesh_opt,
+            topo_opt,
+            &all_lines,
+        ) {
+            if t < best_surface_t {
+                best_surface_t = t;
+                best_surface_contour = Some((entity, contour));
+            }
+        }
+    }
+
+    if let Some((v_ent, v_contour, v_t)) = vertex_resolved {
+        if v_t <= best_surface_t + VERTEX_SNAP_RADIUS {
+            return Some((v_ent, v_contour));
+        }
+    }
+
+    best_surface_contour
 }
 
 fn handle_offset_tool_interaction(
@@ -2652,6 +3081,10 @@ fn handle_offset_tool_interaction(
     window_query: Query<&Window, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<OrbitCamera>>,
     cad_objects: Query<(Entity, &CadObject)>,
+    transforms: Query<&Transform>,
+    mesh_handles: Query<&Handle<Mesh>>,
+    topologies: Query<&EditableBlockTopology>,
+    meshes: Res<Assets<Mesh>>,
     mut selected: ResMut<SelectedCadObjects>,
     mut offset_state: ResMut<OffsetToolState>,
     mut vcb: ResMut<VcbInput>,
@@ -2689,9 +3122,14 @@ fn handle_offset_tool_interaction(
         offset_state.hovered_entity = None;
         offset_state.hovered_contour = None;
         if let Some(ray) = cursor_ray {
-            if let Some((hit_ent, contour)) =
-                detect_hovered_coplanar_contour(ray, &cad_objects)
-            {
+            if let Some((hit_ent, contour)) = detect_hovered_coplanar_contour(
+                ray,
+                &cad_objects,
+                &transforms,
+                &mesh_handles,
+                &topologies,
+                &meshes,
+            ) {
                 offset_state.hovered_entity = Some(hit_ent);
                 offset_state.hovered_contour = Some(contour.clone());
                 if mouse_buttons.just_pressed(MouseButton::Left) {
@@ -2822,90 +3260,6 @@ fn intersect_ray_with_plane(
     None
 }
 
-fn detect_hovered_coplanar_contour(
-    ray: Ray3d,
-    cad_objects: &Query<(Entity, &CadObject)>,
-) -> Option<(Entity, OffsetContour)> {
-    let vertex_resolved = resolve_vertex_parent_face_contour(ray, cad_objects);
-
-    let mut best_block_t = f32::MAX;
-    let mut best_block_contour: Option<(Entity, OffsetContour)> = None;
-
-    for (entity, obj) in cad_objects.iter() {
-        if let CadGeometryKind::Block { center, size } = obj.geometry {
-            if let Some(face_hit) = raycast_block_face_exact(ray, center, size) {
-                if face_hit.t < best_block_t {
-                    if let Some(contour) =
-                        OffsetContour::from_block_face_hit(&face_hit, obj.group_id)
-                    {
-                        best_block_t = face_hit.t;
-                        best_block_contour = Some((entity, contour));
-                    }
-                }
-            }
-        }
-    }
-
-    let mut best_line_t = f32::MAX;
-    let mut best_line_contour: Option<(Entity, OffsetContour)> = None;
-
-    for (entity, obj) in cad_objects.iter() {
-        if let CadGeometryKind::Line { start, end, radius } = obj.geometry {
-            let pick_radius = (radius * 2.5_f32).max(0.18_f32);
-            if let Some(t) = ray_intersects_segment_capsule(ray, start, end, pick_radius) {
-                if t < best_line_t {
-                    if let Some(contour) =
-                        detect_closed_line_loop_contour(start, end, obj.group_id, cad_objects)
-                    {
-                        best_line_t = t;
-                        best_line_contour = Some((entity, contour));
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some((v_ent, v_contour, v_t)) = vertex_resolved {
-        let min_surface_t = best_block_t.min(best_line_t);
-        if v_t <= min_surface_t + VERTEX_SNAP_RADIUS {
-            return Some((v_ent, v_contour));
-        }
-    }
-
-    match (best_block_contour, best_line_contour) {
-        (Some(block_res), Some(line_res)) => {
-            if best_line_t + 0.05_f32 < best_block_t {
-                Some(line_res)
-            } else {
-                Some(block_res)
-            }
-        }
-        (Some(block_res), None) => Some(block_res),
-        (None, Some(line_res)) => Some(line_res),
-        (None, None) => None,
-    }
-}
-
-fn detect_closed_line_loop_contour(
-    seed_start: Vec3,
-    seed_end: Vec3,
-    group_id: Option<GroupId>,
-    cad_objects: &Query<(Entity, &CadObject)>,
-) -> Option<OffsetContour> {
-    let mut segments: Vec<(Vec3, Vec3)> = Vec::new();
-    for (_ent, obj) in cad_objects.iter() {
-        if let CadGeometryKind::Line {
-            start: s, end: e, ..
-        } = obj.geometry
-        {
-            segments.push((s, e));
-        }
-    }
-
-    let ordered_loop = assemble_closed_loop_from_segments(seed_start, seed_end, &segments)?;
-    OffsetContour::from_coplanar_loop_3d(&ordered_loop, None, group_id)
-}
-
 fn detect_offset_contour_for_object(
     hit_obj: &CadObject,
     all_line_segments: &[(Vec3, Vec3)],
@@ -2986,85 +3340,62 @@ fn assemble_closed_loop_from_segments(
     None
 }
 
-fn raycast_subdivided_face_regions(
+fn raycast_manifold_polygon_face(
     ray: Ray3d,
-    split: &SubdividedFaceSplit,
+    face: &ManifoldPolygonFace,
     group_id: Option<GroupId>,
-) -> Option<(f32, Vec3, SubFaceRegionKind, OffsetContour, Option<OffsetContour>)> {
-    let normal = split.face_normal;
+) -> Option<(
+    f32,
+    Vec3,
+    SubFaceRegionKind,
+    OffsetContour,
+    Option<OffsetContour>,
+)> {
+    let normal = face.normal;
     if ray.direction.as_vec3().dot(normal.as_vec3()) >= -1e-6_f32 {
         return None;
     }
 
-    let inner_verts = split.current_inner_loop_3d();
-    let inner_contour =
-        OffsetContour::from_coplanar_loop_3d(&inner_verts, Some(normal), group_id)?;
-
-    let outer_verts = split.current_outer_loop_3d();
     let outer_contour =
-        OffsetContour::from_coplanar_loop_3d(&outer_verts, Some(normal), group_id)?;
+        OffsetContour::from_coplanar_loop_3d(&face.outer_loop, Some(normal), group_id)?;
 
-    let frame_hole_verts = split.current_frame_inner_rim_3d();
-    let frame_hole_contour =
-        OffsetContour::from_coplanar_loop_3d(&frame_hole_verts, Some(normal), group_id)?;
-
-    let mut best_hit: Option<(
-        f32,
-        Vec3,
-        SubFaceRegionKind,
-        OffsetContour,
-        Option<OffsetContour>,
-    )> = None;
-
-    if let Some(hit_inner) = intersect_ray_with_plane(
-        ray,
-        inner_contour.plane_origin,
-        normal,
-        MAX_PLANE_RAY_DIST * 2.0_f32,
-    ) {
-        let uv = inner_contour.project_world_to_uv(hit_inner);
-        if is_point_inside_polygon_2d(uv, &inner_contour.vertices_uv) {
-            let t = ray.origin.distance(hit_inner);
-            best_hit = Some((
-                t,
-                hit_inner,
-                SubFaceRegionKind::InnerLoop,
-                inner_contour.clone(),
-                None,
-            ));
-        }
-    }
-
-    if let Some(hit_outer) = intersect_ray_with_plane(
+    let hit_pt = intersect_ray_with_plane(
         ray,
         outer_contour.plane_origin,
         normal,
         MAX_PLANE_RAY_DIST * 2.0_f32,
-    ) {
-        let uv_out = outer_contour.project_world_to_uv(hit_outer);
-        let uv_hole = frame_hole_contour.project_world_to_uv(hit_outer);
-        let in_outer = is_point_inside_polygon_2d(uv_out, &outer_contour.vertices_uv);
-        let in_hole = is_point_inside_polygon_2d(uv_hole, &frame_hole_contour.vertices_uv);
+    )?;
 
-        if in_outer && !in_hole {
-            let t = ray.origin.distance(hit_outer);
-            let replace = match &best_hit {
-                Some((prev_t, ..)) => t < *prev_t,
-                None => true,
-            };
-            if replace {
-                best_hit = Some((
-                    t,
-                    hit_outer,
-                    SubFaceRegionKind::OuterFrame,
-                    outer_contour,
-                    Some(frame_hole_contour),
-                ));
-            }
-        }
+    let uv_out = outer_contour.project_world_to_uv(hit_pt);
+    if !is_point_inside_polygon_2d(uv_out, &outer_contour.vertices_uv) {
+        return None;
     }
 
-    best_hit
+    if let Some(last_hole) = face.inner_holes.last() {
+        let hole_contour =
+            OffsetContour::from_coplanar_loop_3d(last_hole, Some(normal), group_id)?;
+        let uv_hole = hole_contour.project_world_to_uv(hit_pt);
+        if is_point_inside_polygon_2d(uv_hole, &hole_contour.vertices_uv) {
+            return None;
+        }
+        let t = ray.origin.distance(hit_pt);
+        return Some((
+            t,
+            hit_pt,
+            SubFaceRegionKind::OuterFrame,
+            outer_contour,
+            Some(hole_contour),
+        ));
+    }
+
+    let t = ray.origin.distance(hit_pt);
+    Some((
+        t,
+        hit_pt,
+        SubFaceRegionKind::InnerLoop,
+        outer_contour,
+        None,
+    ))
 }
 
 fn detect_hovered_extrudable_face(
@@ -3084,46 +3415,31 @@ fn detect_hovered_extrudable_face(
 
     for (entity, obj) in cad_objects.iter() {
         if let CadGeometryKind::Block { center, size } = obj.geometry {
-            let topo = topologies
-                .get(entity)
-                .cloned()
-                .unwrap_or_default();
+            let mut topo = topologies.get(entity).cloned().unwrap_or_default();
+            topo.ensure_initialized(center, size);
 
-            for split in &topo.face_splits {
+            for face_poly in &topo.faces {
                 if let Some((t, hit_pt, region_kind, contour, hole_contour)) =
-                    raycast_subdivided_face_regions(ray, split, obj.group_id)
+                    raycast_manifold_polygon_face(ray, face_poly, obj.group_id)
                 {
                     if t < best_block_t {
                         best_block_t = t;
+                        let classified_kind = if topo.faces.len() <= 6
+                            && face_poly.inner_holes.is_empty()
+                        {
+                            SubFaceRegionKind::WholeFace
+                        } else {
+                            region_kind
+                        };
                         best_block_face = Some(ExtrudableFace {
                             entity,
                             is_block_face: true,
-                            region_kind,
+                            region_kind: classified_kind,
                             original_object: obj.clone(),
                             original_topology: topo.clone(),
                             contour,
                             inner_hole_contour: hole_contour,
                             drag_anchor_3d: hit_pt,
-                        });
-                    }
-                }
-            }
-
-            if let Some(face_hit) = raycast_block_face_exact(ray, center, size) {
-                if topo.find_split(face_hit.normal).is_none() && face_hit.t < best_block_t {
-                    if let Some(contour) =
-                        OffsetContour::from_block_face_hit(&face_hit, obj.group_id)
-                    {
-                        best_block_t = face_hit.t;
-                        best_block_face = Some(ExtrudableFace {
-                            entity,
-                            is_block_face: true,
-                            region_kind: SubFaceRegionKind::WholeFace,
-                            original_object: obj.clone(),
-                            original_topology: topo,
-                            contour,
-                            inner_hole_contour: None,
-                            drag_anchor_3d: face_hit.hit_point,
                         });
                     }
                 }
@@ -3193,29 +3509,21 @@ fn compute_extruded_block_state_for_face(
     let mut next_geom = face.original_object.geometry;
     let mut next_topo = face.original_topology.clone();
 
-    match face.region_kind {
-        SubFaceRegionKind::InnerLoop => {
-            if let Some(split) = next_topo.find_split_mut(normal) {
-                split.inner_extrusion_depth += distance;
-            }
-        }
-        SubFaceRegionKind::OuterFrame => {
-            if let Some(split) = next_topo.find_split_mut(normal) {
-                split.outer_frame_extrusion_depth += distance;
-            }
-        }
-        SubFaceRegionKind::WholeFace => {
-            next_geom = next_geom.extruded_along_face(normal, distance);
-            if let Some(split) = next_topo.find_split_mut(normal) {
-                let shift = normal.as_vec3() * distance;
-                for v in &mut split.base_outer_loop {
-                    *v += shift;
-                }
-                for v in &mut split.base_inner_loop {
-                    *v += shift;
-                }
-            }
-        }
+    if let CadGeometryKind::Block { center, size } = next_geom {
+        next_topo.ensure_initialized(center, size);
+    }
+
+    if let Some(target_v4) = face.contour.base_vertices_4() {
+        next_topo.extrude_face_region(normal, target_v4, face.region_kind, distance);
+    }
+
+    if let Some((new_center, new_size)) = next_topo.compute_bounds() {
+        next_geom = CadGeometryKind::Block {
+            center: new_center,
+            size: new_size,
+        };
+    } else {
+        next_geom = next_geom.extruded_along_face(normal, distance);
     }
 
     (next_geom, next_topo)
@@ -4026,24 +4334,19 @@ fn render_active_tool_gizmos(
     let seam_edge_color = Color::srgb(0.18, 0.22, 0.28);
     for (_obj, maybe_topo) in cad_objects.iter() {
         if let Some(topo) = maybe_topo {
-            for split in &topo.face_splits {
-                let outer_3d = split.current_outer_loop_3d();
-                let frame_rim_3d = split.current_frame_inner_rim_3d();
-                let inner_3d = split.current_inner_loop_3d();
-
+            for face_poly in &topo.faces {
                 for k in 0..4 {
                     let next_k = (k + 1) % 4;
-                    gizmos.line(outer_3d[k], outer_3d[next_k], seam_edge_color);
-                    gizmos.line(frame_rim_3d[k], frame_rim_3d[next_k], seam_edge_color);
-                    gizmos.line(inner_3d[k], inner_3d[next_k], seam_edge_color);
-
-                    if (split.inner_extrusion_depth - split.outer_frame_extrusion_depth).abs()
-                        > 0.005_f32
-                    {
-                        gizmos.line(frame_rim_3d[k], inner_3d[k], seam_edge_color);
-                    }
-                    if split.outer_frame_extrusion_depth.abs() > 0.005_f32 {
-                        gizmos.line(split.base_outer_loop[k], outer_3d[k], seam_edge_color);
+                    gizmos.line(
+                        face_poly.outer_loop[k],
+                        face_poly.outer_loop[next_k],
+                        seam_edge_color,
+                    );
+                }
+                for hole in &face_poly.inner_holes {
+                    for k in 0..4 {
+                        let next_k = (k + 1) % 4;
+                        gizmos.line(hole[k], hole[next_k], seam_edge_color);
                     }
                 }
             }
