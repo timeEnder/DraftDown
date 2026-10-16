@@ -1,10 +1,10 @@
 [package]
-name = "sketchcraft"
-version = "0.1.0"
+name = "draftdown"
+version = "0.1.3"
 edition = "2021"
+description = "Open-source 3D CAD workspace built in Rust with Bevy 0.14 and bevy_egui 0.28 for Linux/Wayland/Hyprland"
+license = "MIT"
 
 [dependencies]
-bevy = "0.14"
+bevy = { version = "0.14", features = ["wayland"] }
 bevy_egui = "0.28"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"

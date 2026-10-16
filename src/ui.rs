@@ -1,164 +1,127 @@
-use bevy::{app::AppExit, prelude::*};
+use bevy::app::AppExit;
+use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
-use crate::{
-    commands::{CadObject, CommandHistory, DeleteCommand, HistoryAction, PendingHistoryActions},
-    tools::{
-        ActiveToolState, AxisInference, CadTool, CursorRayState, FocalPoint, MoveToolState,
-        OffsetToolState, ScaleToolState, SelectedCadObjects, ToolDraftState, VcbInput,
-    },
+use crate::commands::{CadGeometryKind, CadObject, CommandHistory, DeleteCommand};
+use crate::tools::{
+    ActiveToolState, AxisInference, CadTool, CursorRayState, FocalPoint, MoveToolState,
+    OffsetToolState, ScaleToolState, SelectedCadObjects, SnapAxisKind, ToolDraftState, VcbInput,
 };
 
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CadUiSet;
 
-#[derive(Resource, Debug, Default)]
-pub struct UiInputCapture {
-    pub egui_wants_pointer: bool,
-    pub egui_wants_keyboard: bool,
-}
-
 pub struct CadUiPlugin;
 
 impl Plugin for CadUiPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<UiInputCapture>()
-            .add_systems(Update, draw_draftdown_ui.in_set(CadUiSet));
+        app.add_systems(Update, draw_draftdown_ui.in_set(CadUiSet));
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn draw_draftdown_ui(
-    mut contexts: EguiContexts,
-    mut tool_state: ResMut<ActiveToolState>,
-    mut ui_capture: ResMut<UiInputCapture>,
-    mut draft: ResMut<ToolDraftState>,
+fn draw_draftdown_ui(
+    mut egui_contexts: EguiContexts,
+    mut active_tool: ResMut<ActiveToolState>,
+    mut draft_state: ResMut<ToolDraftState>,
     mut move_state: ResMut<MoveToolState>,
     mut scale_state: ResMut<ScaleToolState>,
     mut offset_state: ResMut<OffsetToolState>,
-    mut vcb: ResMut<VcbInput>,
     mut selected: ResMut<SelectedCadObjects>,
-    mut pending_actions: ResMut<PendingHistoryActions>,
-    mut app_exit_events: EventWriter<AppExit>,
-    cursor_ray: Res<CursorRayState>,
+    cursor_state: Res<CursorRayState>,
     focal_point: Res<FocalPoint>,
-    history: Res<CommandHistory>,
+    inference: Res<AxisInference>,
+    vcb: Res<VcbInput>,
+    mut history: ResMut<CommandHistory>,
     cad_objects: Query<(Entity, &CadObject)>,
+    mut exit_writer: EventWriter<AppExit>,
 ) {
-    let Some(ctx) = contexts.try_ctx_mut() else {
+    let Some(ctx) = egui_contexts.try_ctx_mut() else {
         return;
     };
 
-    let mut visuals = egui::Visuals::dark();
-    visuals.window_rounding = egui::Rounding::same(4.0);
-    visuals.panel_fill = egui::Color32::from_rgba_unmultiplied(24, 26, 31, 246);
-    ctx.set_visuals(visuals);
-
-    egui::TopBottomPanel::bottom("draftdown_status_bar")
-        .exact_height(32.0)
+    egui::TopBottomPanel::bottom("draftdown_bottom_status_bar")
+        .exact_height(34.0_f32)
         .show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
-                ui.spacing_mut().item_spacing.x = 12.0;
-
-                ui.colored_label(
-                    egui::Color32::from_rgb(100, 195, 255),
-                    format!("Tool: {}", tool_state.current.label()),
+                ui.label(
+                    egui::RichText::new(format!("Tool: {}", active_tool.current.label()))
+                        .strong()
+                        .color(egui::Color32::from_rgb(130, 205, 255)),
                 );
                 ui.separator();
 
-                let pos = draft.current_preview_end;
-                ui.monospace(format!(
-                    "XYZ: ({:+6.2}, {:+6.2}, {:+6.2})",
-                    pos.x, pos.y, pos.z
-                ));
-                ui.separator();
-
-                let fp = focal_point.0;
-                ui.monospace(format!(
-                    "Pivot: ({:+.1}, {:+.1}, {:+.1})",
-                    fp.x, fp.y, fp.z
-                ));
-                ui.separator();
-
-                let inf_color = match cursor_ray.inference {
-                    AxisInference::None => egui::Color32::from_rgb(180, 185, 195),
-                    AxisInference::RedX => egui::Color32::from_rgb(235, 65, 65),
-                    AxisInference::GreenY => egui::Color32::from_rgb(65, 210, 80),
-                    AxisInference::BlueZ => egui::Color32::from_rgb(75, 145, 255),
-                    AxisInference::ParallelNeighbor { .. }
-                    | AxisInference::FlushTopFace { .. } => egui::Color32::from_rgb(245, 65, 220),
-                };
-                ui.colored_label(inf_color, cursor_ray.inference.label());
-                ui.separator();
-
-                if let Some(ref msg) = vcb.last_status_message {
-                    ui.weak(msg);
+                if cursor_state.has_hit {
+                    let p = cursor_state.snapped_pos;
+                    ui.label(format!(
+                        "XYZ: ({:.2}, {:.2}, {:.2}) [{}]",
+                        p.x, p.y, p.z, cursor_state.plane_label
+                    ));
                 } else {
-                    ui.weak(tool_state.current.status_hint());
+                    ui.label("XYZ: (--, --, --)");
+                }
+
+                ui.separator();
+                let fp = focal_point.0;
+                ui.label(format!("Pivot: ({:.1}, {:.1}, {:.1})", fp.x, fp.y, fp.z));
+
+                ui.separator();
+                let snap_color = match inference.snap_kind {
+                    SnapAxisKind::RedX => egui::Color32::from_rgb(235, 65, 70),
+                    SnapAxisKind::GreenY => egui::Color32::from_rgb(55, 210, 95),
+                    SnapAxisKind::BlueZ => egui::Color32::from_rgb(65, 145, 250),
+                    SnapAxisKind::ParallelNeighbor => egui::Color32::from_rgb(245, 75, 230),
+                    SnapAxisKind::None => egui::Color32::from_rgb(185, 190, 200),
+                };
+                ui.label(
+                    egui::RichText::new(inference.snap_kind.status_text())
+                        .strong()
+                        .color(snap_color),
+                );
+
+                if active_tool.current == CadTool::Offset && offset_state.is_dragging {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Offset: {:+.2} m",
+                            offset_state.current_offset_distance
+                        ))
+                        .strong()
+                        .color(egui::Color32::from_rgb(255, 175, 45)),
+                    );
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let vcb_display = if vcb.buffer.is_empty() {
-                        match tool_state.current {
-                            CadTool::LineDraw => draft
-                                .active_start_point
-                                .map(|s| format!("{:.2} m", s.distance(draft.current_preview_end)))
-                                .unwrap_or_default(),
-                            CadTool::Block => draft
-                                .active_start_point
-                                .map(|s| {
-                                    format!(
-                                        "{:.2}, {:.2}, {:.2}",
-                                        (draft.current_preview_end.x - s.x).abs(),
-                                        (draft.current_preview_end.y - s.y).abs(),
-                                        draft.default_block_height
-                                    )
-                                })
-                                .unwrap_or_default(),
-                            CadTool::Move => move_state
-                                .active_drag
-                                .as_ref()
-                                .map(|d| format!("{:.2} m", d.current_offset.length()))
-                                .unwrap_or_default(),
-                            CadTool::Scale => scale_state
-                                .active_drag
-                                .as_ref()
-                                .map(|d| {
-                                    let f = d.current_scale_factors;
-                                    format!("{:.2}, {:.2}, {:.2}", f.x, f.y, f.z)
-                                })
-                                .unwrap_or_else(|| String::from("1.00")),
-                            CadTool::Offset => {
-                                format!("{:+.2} m", offset_state.current_offset_distance)
-                            }
-                            _ => String::new(),
+                        if vcb.last_status.is_empty() {
+                            "Type dimension + Enter".to_string()
+                        } else {
+                            vcb.last_status.clone()
                         }
                     } else {
-                        format!("{}|", vcb.buffer)
+                        format!("{}_", vcb.buffer)
                     };
 
-                    egui::Frame::canvas(ui.style())
-                        .fill(egui::Color32::from_rgb(14, 16, 20))
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(24, 28, 36))
                         .stroke(egui::Stroke::new(
                             1.0_f32,
-                            if vcb.buffer.is_empty() {
-                                egui::Color32::from_rgb(70, 76, 88)
-                            } else {
-                                egui::Color32::from_rgb(100, 195, 255)
-                            },
+                            egui::Color32::from_rgb(90, 150, 230),
                         ))
-                        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+                        .inner_margin(egui::Margin::symmetric(8.0_f32, 3.0_f32))
+                        .rounding(4.0_f32)
                         .show(ui, |ui| {
-                            ui.set_min_width(145.0);
-                            ui.monospace(
+                            ui.label(
                                 egui::RichText::new(vcb_display)
+                                    .monospace()
+                                    .strong()
                                     .color(egui::Color32::from_rgb(240, 245, 255)),
                             );
                         });
 
                     ui.label(
-                        egui::RichText::new(format!("{}:", tool_state.current.vcb_label()))
-                            .strong(),
+                        egui::RichText::new("Measurements (VCB):")
+                            .strong()
+                            .color(egui::Color32::from_rgb(190, 200, 215)),
                     );
                 });
             });
@@ -166,151 +129,183 @@ pub fn draw_draftdown_ui(
 
     egui::SidePanel::left("draftdown_left_toolbar")
         .resizable(false)
-        .default_width(265.0)
+        .default_width(245.0_f32)
         .show(ctx, |ui| {
-            egui::TopBottomPanel::bottom("draftdown_toolbar_footer")
-                .frame(egui::Frame::none())
-                .show_inside(ui, |ui| {
-                    ui.add_space(4.0);
-                    ui.separator();
-                    let exit_btn = egui::Button::new(
-                        egui::RichText::new("Exit Application (Ctrl+Q)")
-                            .color(egui::Color32::from_rgb(255, 230, 230))
-                            .strong(),
+            ui.add_space(6.0_f32);
+            ui.heading(
+                egui::RichText::new("DraftDown CAD")
+                    .strong()
+                    .color(egui::Color32::from_rgb(230, 240, 255)),
+            );
+            ui.label(
+                egui::RichText::new("Wayland / Hyprland 3D Workspace")
+                    .small()
+                    .color(egui::Color32::from_rgb(150, 160, 175)),
+            );
+            ui.separator();
+
+            ui.label(egui::RichText::new("Modeling & Transform Tools").strong());
+            ui.add_space(4.0_f32);
+
+            let tool_items = [
+                CadTool::Select,
+                CadTool::LineDraw,
+                CadTool::Block,
+                CadTool::Move,
+                CadTool::Scale,
+                CadTool::Offset,
+                CadTool::PushPullExtrude,
+            ];
+
+            for item in tool_items {
+                let is_active = active_tool.current == item;
+                let fill_col = if is_active {
+                    egui::Color32::from_rgb(42, 105, 185)
+                } else {
+                    egui::Color32::from_rgb(38, 42, 52)
+                };
+                let btn = egui::Button::new(
+                    egui::RichText::new(item.label()).color(egui::Color32::WHITE),
+                )
+                .fill(fill_col)
+                .min_size(egui::vec2(220.0_f32, 28.0_f32));
+
+                if ui.add(btn).clicked() && active_tool.current != item {
+                    active_tool.current = item;
+                    draft_state.reset();
+                    move_state.active_drag = None;
+                    scale_state.active_drag = None;
+                    offset_state.reset_drag();
+                }
+            }
+
+            ui.add_space(8.0_f32);
+            ui.separator();
+            ui.label(egui::RichText::new("History (Command Stack)").strong());
+            ui.add_space(4.0_f32);
+
+            ui.horizontal(|ui| {
+                let undo_enabled = history.can_undo();
+                let redo_enabled = history.can_redo();
+
+                if ui
+                    .add_enabled(
+                        undo_enabled,
+                        egui::Button::new(format!("Undo ({})", history.undo_count())),
                     )
-                    .fill(egui::Color32::from_rgb(145, 34, 38))
-                    .min_size(egui::vec2(ui.available_width(), 34.0));
-
-                    if ui.add(exit_btn).clicked() {
-                        app_exit_events.send(AppExit::Success);
-                    }
-                    ui.add_space(4.0);
-                });
-
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.add_space(6.0);
-                ui.heading("DraftDown");
-                ui.small("Z-Up 3D CAD Workspace");
-                ui.separator();
-
-                ui.label(egui::RichText::new("CAD Tools").strong());
-                ui.add_space(4.0);
-
-                let tool_list = [
-                    CadTool::Select,
-                    CadTool::LineDraw,
-                    CadTool::Block,
-                    CadTool::Move,
-                    CadTool::Scale,
-                    CadTool::Offset,
-                    CadTool::PushPullExtrude,
-                ];
-
-                for item in tool_list {
-                    let active = tool_state.current == item;
-                    let btn = egui::Button::new(item.label())
-                        .selected(active)
-                        .min_size(egui::vec2(ui.available_width(), 30.0));
-
-                    if ui.add(btn).clicked() {
-                        tool_state.current = item;
-                        draft.active_start_point = None;
-                        move_state.active_drag = None;
-                        scale_state.active_drag = None;
-                        offset_state.is_dragging = false;
-                        offset_state.active_contour = None;
-                        vcb.buffer.clear();
-                    }
-                    ui.add_space(2.0);
+                    .clicked()
+                {
+                    history.request_undo();
                 }
 
-                ui.add_space(6.0);
-                ui.separator();
-                ui.label(egui::RichText::new("Command History").strong());
-                ui.add_space(4.0);
+                if ui
+                    .add_enabled(
+                        redo_enabled,
+                        egui::Button::new(format!("Redo ({})", history.redo_count())),
+                    )
+                    .clicked()
+                {
+                    history.request_redo();
+                }
+            });
 
-                ui.horizontal(|ui| {
-                    let half = (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
-                    let u_btn = egui::Button::new(format!("Undo ({})", history.undo_stack.len()))
-                        .min_size(egui::vec2(half, 28.0));
-                    if ui.add_enabled(history.can_undo(), u_btn).clicked() {
-                        draft.active_start_point = None;
-                        pending_actions.queue.push(HistoryAction::Undo);
+            if let Some(desc) = history.last_undo_description() {
+                ui.label(
+                    egui::RichText::new(format!("Last: {desc}"))
+                        .small()
+                        .color(egui::Color32::from_rgb(155, 165, 180)),
+                );
+            }
+
+            ui.add_space(8.0_f32);
+            ui.separator();
+            ui.label(egui::RichText::new("Selection Inspector").strong());
+
+            let total_entities = cad_objects.iter().count();
+            ui.label(format!("Scene Objects: {total_entities}"));
+
+            if let Some(sel_ent) = selected.primary() {
+                if let Ok((_, obj)) = cad_objects.get(sel_ent) {
+                    ui.label(
+                        egui::RichText::new(format!("Selected: {}", obj.label))
+                            .color(egui::Color32::from_rgb(80, 220, 255))
+                            .strong(),
+                    );
+                    if let Some(gid) = obj.group_id {
+                        ui.label(format!("Group ID: #{}", gid.0));
                     }
-
-                    let r_btn = egui::Button::new(format!("Redo ({})", history.redo_stack.len()))
-                        .min_size(egui::vec2(half, 28.0));
-                    if ui.add_enabled(history.can_redo(), r_btn).clicked() {
-                        draft.active_start_point = None;
-                        pending_actions.queue.push(HistoryAction::Redo);
-                    }
-                });
-
-                ui.add_space(6.0);
-                ui.separator();
-                ui.label(egui::RichText::new("Selection & Groups").strong());
-                let total_count = cad_objects.iter().count();
-                let sel_count = selected.entities.len();
-                ui.small(format!("Objects: {total_count} | Selected: {sel_count}"));
-
-                let del_btn = egui::Button::new("Delete Selected (Del)")
-                    .min_size(egui::vec2(ui.available_width(), 26.0));
-                if ui.add_enabled(sel_count > 0, del_btn).clicked() {
-                    let mut snaps = Vec::new();
-                    for &ent in &selected.entities {
-                        if let Ok((e, o)) = cad_objects.get(ent) {
-                            snaps.push((e, o.clone()));
+                    match obj.geometry {
+                        CadGeometryKind::Line { start, end, .. } => {
+                            ui.label(format!("Length: {:.2} m", start.distance(end)));
+                        }
+                        CadGeometryKind::Block { size, .. } => {
+                            ui.label(format!(
+                                "Size: {:.2} x {:.2} x {:.2} m",
+                                size.x, size.y, size.z
+                            ));
                         }
                     }
-                    selected.entities.clear();
-                    if !snaps.is_empty() {
-                        pending_actions
-                            .queue
-                            .push(HistoryAction::Execute(Box::new(DeleteCommand::new(snaps))));
+
+                    if ui
+                        .button(
+                            egui::RichText::new("Delete Selected (Del)")
+                                .color(egui::Color32::from_rgb(255, 120, 120)),
+                        )
+                        .clicked()
+                    {
+                        history.execute_command(Box::new(DeleteCommand::new(vec![(
+                            sel_ent,
+                            obj.clone(),
+                        )])));
+                        selected.clear();
                     }
                 }
+            } else {
+                ui.label(
+                    egui::RichText::new("No object selected")
+                        .italics()
+                        .color(egui::Color32::from_rgb(140, 145, 155)),
+                );
+            }
 
-                ui.add_space(6.0);
-                ui.separator();
-                egui::CollapsingHeader::new(
-                    egui::RichText::new("Hotkeys Cheat Sheet").strong(),
+            ui.add_space(8.0_f32);
+            ui.separator();
+
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Hotkeys Cheat Sheet").strong(),
+            )
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label("Space : Select Tool");
+                ui.label("L : Line Tool (Continuous Chain)");
+                ui.label("B : 3D Block / Box Tool");
+                ui.label("M : Move Tool (Translate)");
+                ui.label("S : Scale Tool (8-Handle Box)");
+                ui.label("F : Offset Tool (Coplanar 2D UV)");
+                ui.label("Hold Shift : Lock Blue (Z) Axis");
+                ui.label("MMB Drag : Orbit Targeted Object");
+                ui.label("Shift + MMB : Pan Focal Pivot");
+                ui.label("Scroll : Smooth Zoom");
+                ui.label("0-9 / , / Enter : VCB Dimensions");
+                ui.label("Del / Backspace : Delete Object");
+                ui.label("Esc : Break Chain / Cancel Drag");
+                ui.label("Ctrl+Z / Ctrl+Y : Undo / Redo");
+                ui.label("Ctrl+Q : Exit Application");
+            });
+
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                ui.add_space(8.0_f32);
+                let exit_btn = egui::Button::new(
+                    egui::RichText::new("Exit Application (Ctrl+Q)")
+                        .strong()
+                        .color(egui::Color32::WHITE),
                 )
-                .default_open(true)
-                .show(ui, |ui| {
-                    let hotkeys = [
-                        ("[Spacebar]", "Select Tool"),
-                        ("[L]", "Line Draw Tool"),
-                        ("[B]", "Block / Box Tool"),
-                        ("[M]", "Move Tool"),
-                        ("[S]", "Scale / Resize Tool"),
-                        ("[F]", "Offset Tool"),
-                        ("[Delete / Backspace]", "Delete Selected Object"),
-                        ("[Shift + MMB Drag]", "Pan Camera Field"),
-                        ("[MMB Drag]", "Orbit Camera View"),
-                        ("[Mouse Scroll]", "Zoom In / Out"),
-                        (
-                            "[Hold Shift while drawing/moving]",
-                            "Lock to Vertical Blue (Z) Axis",
-                        ),
-                        ("[Ctrl + Z]", "Undo Last Action"),
-                        ("[Ctrl + Y]", "Redo Action"),
-                        ("[Escape]", "Cancel Operation / Break Chain"),
-                        ("[Ctrl + Q]", "Exit Application cleanly"),
-                    ];
+                .fill(egui::Color32::from_rgb(175, 42, 48))
+                .min_size(egui::vec2(220.0_f32, 30.0_f32));
 
-                    for (k, desc) in hotkeys {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(115, 205, 255),
-                                egui::RichText::new(k).monospace().small(),
-                            );
-                            ui.small(format!("- {desc}"));
-                        });
-                    }
-                });
+                if ui.add(exit_btn).clicked() {
+                    exit_writer.send(AppExit::Success);
+                }
             });
         });
-
-    ui_capture.egui_wants_pointer = ctx.wants_pointer_input() || ctx.is_pointer_over_area();
-    ui_capture.egui_wants_keyboard = ctx.wants_keyboard_input();
 }

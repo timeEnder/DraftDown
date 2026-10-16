@@ -1,3 +1,6 @@
+use std::collections::VecDeque;
+
+use bevy::math::primitives::{Cuboid, Cylinder, Sphere};
 use bevy::prelude::*;
 
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
@@ -8,7 +11,7 @@ pub struct CadCommandsPlugin;
 impl Plugin for CadCommandsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CommandHistory>()
-            .init_resource::<PendingHistoryActions>()
+            .init_resource::<NextObjectSerial>()
             .add_systems(
                 Update,
                 flush_history_action_queue.in_set(CadCommandExecutionSet),
@@ -16,13 +19,13 @@ impl Plugin for CadCommandsPlugin {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GroupId(pub u64);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Component, Debug, Clone, Copy)]
 pub struct MaterialColor(pub Color);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CadGeometryKind {
     Line {
         start: Vec3,
@@ -50,124 +53,17 @@ impl CadGeometryKind {
         }
     }
 
-    pub fn scaled_from_anchor(&self, pivot: Vec3, factors: Vec3) -> Self {
-        let clamped = Vec3::new(
-            factors.x.abs().max(0.05),
-            factors.y.abs().max(0.05),
-            factors.z.abs().max(0.05),
-        );
-
+    pub fn scaled_from_anchor(&self, anchor: Vec3, factors: Vec3) -> Self {
         match *self {
-            Self::Line { start, end, radius } => {
-                let s = pivot + (start - pivot) * clamped;
-                let mut e = pivot + (end - pivot) * clamped;
-                if s.distance(e) < 0.05 {
-                    let dir = (end - start).try_normalize().unwrap_or(Vec3::X);
-                    e = s + dir * 0.05;
-                }
-                Self::Line {
-                    start: s,
-                    end: e,
-                    radius,
-                }
-            }
-            Self::Block { center, size } => {
-                let half = size * 0.5;
-                let p_min = pivot + (center - half - pivot) * clamped;
-                let p_max = pivot + (center + half - pivot) * clamped;
-                let low = p_min.min(p_max);
-                let high = p_min.max(p_max);
-                let next_size = (high - low).max(Vec3::splat(0.05));
-                Self::Block {
-                    center: (low + high) * 0.5,
-                    size: next_size,
-                }
-            }
-        }
-    }
-
-    pub fn centroid(&self) -> Vec3 {
-        match *self {
-            Self::Line { start, end, .. } => (start + end) * 0.5,
-            Self::Block { center, .. } => center,
-        }
-    }
-
-    pub fn bounds_min_max(&self) -> (Vec3, Vec3) {
-        match *self {
-            Self::Line { start, end, radius } => {
-                let margin = radius.max(0.12);
-                let b_min = start.min(end);
-                let b_max = start.max(end);
-                let span = b_max - b_min;
-                let pad = Vec3::new(
-                    if span.x < margin * 2.0 { margin } else { 0.0 },
-                    if span.y < margin * 2.0 { margin } else { 0.0 },
-                    if span.z < margin * 2.0 { margin } else { 0.0 },
-                );
-                (b_min - pad, b_max + pad)
-            }
-            Self::Block { center, size } => {
-                let half = size.max(Vec3::splat(0.10)) * 0.5;
-                (center - half, center + half)
-            }
-        }
-    }
-
-    pub fn bbox_vertices(&self) -> [Vec3; 8] {
-        let (lo, hi) = self.bounds_min_max();
-        [
-            Vec3::new(lo.x, lo.y, lo.z),
-            Vec3::new(hi.x, lo.y, lo.z),
-            Vec3::new(lo.x, hi.y, lo.z),
-            Vec3::new(hi.x, hi.y, lo.z),
-            Vec3::new(lo.x, lo.y, hi.z),
-            Vec3::new(hi.x, lo.y, hi.z),
-            Vec3::new(lo.x, hi.y, hi.z),
-            Vec3::new(hi.x, hi.y, hi.z),
-        ]
-    }
-
-    pub fn edge_segments(&self) -> Vec<(Vec3, Vec3)> {
-        match *self {
-            Self::Line { start, end, .. } => vec![(start, end)],
-            Self::Block { .. } => {
-                let v = self.bbox_vertices();
-                vec![
-                    (v[0], v[1]),
-                    (v[1], v[3]),
-                    (v[3], v[2]),
-                    (v[2], v[0]),
-                    (v[4], v[5]),
-                    (v[5], v[7]),
-                    (v[7], v[6]),
-                    (v[6], v[4]),
-                    (v[0], v[4]),
-                    (v[1], v[5]),
-                    (v[2], v[6]),
-                    (v[3], v[7]),
-                ]
-            }
-        }
-    }
-
-    pub fn summary_text(&self) -> String {
-        match *self {
-            Self::Line { start, end, .. } => {
-                format!(
-                    "Line L={:.2}m ({:.2}, {:.2}, {:.2}) -> ({:.2}, {:.2}, {:.2})",
-                    start.distance(end),
-                    start.x,
-                    start.y,
-                    start.z,
-                    end.x,
-                    end.y,
-                    end.z
-                )
-            }
-            Self::Block { size, .. } => {
-                format!("Block ({:.2}m x {:.2}m x {:.2}m)", size.x, size.y, size.z)
-            }
+            Self::Line { start, end, radius } => Self::Line {
+                start: anchor + (start - anchor) * factors,
+                end: anchor + (end - anchor) * factors,
+                radius,
+            },
+            Self::Block { center, size } => Self::Block {
+                center: anchor + (center - anchor) * factors,
+                size: (size * factors).max(Vec3::splat(0.1_f32)),
+            },
         }
     }
 }
@@ -180,49 +76,53 @@ pub struct CadObject {
     pub geometry: CadGeometryKind,
 }
 
-pub trait Command: Send + Sync {
+#[derive(Resource, Debug)]
+pub struct NextObjectSerial(pub u64);
+
+impl Default for NextObjectSerial {
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
+impl NextObjectSerial {
+    pub fn next_id(&mut self) -> u64 {
+        let current = self.0;
+        self.0 = self.0.saturating_add(1);
+        current
+    }
+}
+
+pub trait Command: Send + Sync + 'static {
     fn execute(&mut self, world: &mut World);
     fn undo(&mut self, world: &mut World);
-    fn description(&self) -> &'static str {
-        "CAD Action"
-    }
+    fn description(&self) -> &'static str;
+}
+
+enum QueuedHistoryOp {
+    Execute(Box<dyn Command>),
+    Undo,
+    Redo,
 }
 
 #[derive(Resource, Default)]
 pub struct CommandHistory {
-    pub undo_stack: Vec<Box<dyn Command + Send + Sync>>,
-    pub redo_stack: Vec<Box<dyn Command + Send + Sync>>,
+    undo_stack: Vec<Box<dyn Command>>,
+    redo_stack: Vec<Box<dyn Command>>,
+    pending_ops: VecDeque<QueuedHistoryOp>,
 }
 
 impl CommandHistory {
-    pub fn execute_command(
-        &mut self,
-        mut cmd: Box<dyn Command + Send + Sync>,
-        world: &mut World,
-    ) {
-        cmd.execute(world);
-        self.undo_stack.push(cmd);
-        self.redo_stack.clear();
+    pub fn execute_command(&mut self, command: Box<dyn Command>) {
+        self.pending_ops.push_back(QueuedHistoryOp::Execute(command));
     }
 
-    pub fn undo(&mut self, world: &mut World) -> bool {
-        if let Some(mut cmd) = self.undo_stack.pop() {
-            cmd.undo(world);
-            self.redo_stack.push(cmd);
-            true
-        } else {
-            false
-        }
+    pub fn request_undo(&mut self) {
+        self.pending_ops.push_back(QueuedHistoryOp::Undo);
     }
 
-    pub fn redo(&mut self, world: &mut World) -> bool {
-        if let Some(mut cmd) = self.redo_stack.pop() {
-            cmd.execute(world);
-            self.undo_stack.push(cmd);
-            true
-        } else {
-            false
-        }
+    pub fn request_redo(&mut self) {
+        self.pending_ops.push_back(QueuedHistoryOp::Redo);
     }
 
     pub fn can_undo(&self) -> bool {
@@ -232,202 +132,163 @@ impl CommandHistory {
     pub fn can_redo(&self) -> bool {
         !self.redo_stack.is_empty()
     }
+
+    pub fn undo_count(&self) -> usize {
+        self.undo_stack.len()
+    }
+
+    pub fn redo_count(&self) -> usize {
+        self.redo_stack.len()
+    }
+
+    pub fn last_undo_description(&self) -> Option<&'static str> {
+        self.undo_stack.last().map(|c| c.description())
+    }
+
+    pub fn last_redo_description(&self) -> Option<&'static str> {
+        self.redo_stack.last().map(|c| c.description())
+    }
 }
 
-pub enum HistoryAction {
-    Execute(Box<dyn Command + Send + Sync>),
-    Undo,
-    Redo,
-}
+fn flush_history_action_queue(world: &mut World) {
+    loop {
+        let next_op = {
+            let Some(mut history) = world.get_resource_mut::<CommandHistory>() else {
+                return;
+            };
+            history.pending_ops.pop_front()
+        };
 
-#[derive(Resource, Default)]
-pub struct PendingHistoryActions {
-    pub queue: Vec<HistoryAction>,
+        let Some(op) = next_op else {
+            break;
+        };
+
+        match op {
+            QueuedHistoryOp::Execute(mut cmd) => {
+                cmd.execute(world);
+                if let Some(mut history) = world.get_resource_mut::<CommandHistory>() {
+                    history.redo_stack.clear();
+                    history.undo_stack.push(cmd);
+                }
+            }
+            QueuedHistoryOp::Undo => {
+                let popped = world
+                    .get_resource_mut::<CommandHistory>()
+                    .and_then(|mut h| h.undo_stack.pop());
+                if let Some(mut cmd) = popped {
+                    cmd.undo(world);
+                    if let Some(mut history) = world.get_resource_mut::<CommandHistory>() {
+                        history.redo_stack.push(cmd);
+                    }
+                }
+            }
+            QueuedHistoryOp::Redo => {
+                let popped = world
+                    .get_resource_mut::<CommandHistory>()
+                    .and_then(|mut h| h.redo_stack.pop());
+                if let Some(mut cmd) = popped {
+                    cmd.execute(world);
+                    if let Some(mut history) = world.get_resource_mut::<CommandHistory>() {
+                        history.undo_stack.push(cmd);
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub fn remove_cad_entity(world: &mut World, target: Entity) {
-    let attached: Vec<Entity> = world
+    let child_list: Vec<Entity> = world
         .get::<Children>(target)
-        .map(|kids| kids.iter().copied().collect())
+        .map(|children| children.iter().copied().collect())
         .unwrap_or_default();
 
-    for child in attached {
-        if world.get_entity(child).is_some() {
-            world.despawn(child);
-        }
+    for child in child_list {
+        let _ = world.despawn(child);
     }
-    if world.get_entity(target).is_some() {
-        world.despawn(target);
-    }
+    let _ = world.despawn(target);
 }
 
-pub fn apply_geometry_to_existing_entity(
-    world: &mut World,
-    entity: Entity,
-    geometry: CadGeometryKind,
-) {
-    if world.get_entity(entity).is_none() {
-        return;
-    }
-
-    match geometry {
+pub fn instantiate_cad_entity(world: &mut World, cad_obj: CadObject) -> Entity {
+    match cad_obj.geometry {
         CadGeometryKind::Line { start, end, radius } => {
-            let span = end - start;
-            let len = span.length().max(0.001);
-            let mid = (start + end) * 0.5;
-            let dir = (span / len).try_normalize().unwrap_or(Vec3::Y);
-            let rot = Quat::from_rotation_arc(Vec3::Y, dir);
+            let delta = end - start;
+            let length = delta.length().max(0.001_f32);
+            let midpoint = (start + end) * 0.5_f32;
+            let dir = delta / length;
+            let rotation = Quat::from_rotation_arc(Vec3::Y, dir);
 
-            if let Some(new_mesh) = world
-                .get_resource_mut::<Assets<Mesh>>()
-                .map(|mut m| m.add(Cylinder::new(radius, len)))
-            {
-                if let Some(mut h) = world.get_mut::<Handle<Mesh>>(entity) {
-                    *h = new_mesh;
-                }
-            }
-
-            if let Some(mut tr) = world.get_mut::<Transform>(entity) {
-                tr.translation = mid;
-                tr.rotation = rot;
-                tr.scale = Vec3::ONE;
-            }
-
-            let kids: Vec<Entity> = world
-                .get::<Children>(entity)
-                .map(|c| c.iter().copied().collect())
-                .unwrap_or_default();
-            let half = len * 0.5;
-            if let Some(&c0) = kids.first() {
-                if let Some(mut tr) = world.get_mut::<Transform>(c0) {
-                    tr.translation = Vec3::new(0.0, -half, 0.0);
-                }
-            }
-            if let Some(&c1) = kids.get(1) {
-                if let Some(mut tr) = world.get_mut::<Transform>(c1) {
-                    tr.translation = Vec3::new(0.0, half, 0.0);
-                }
-            }
-        }
-        CadGeometryKind::Block { center, size } => {
-            if let Some(new_mesh) = world
-                .get_resource_mut::<Assets<Mesh>>()
-                .map(|mut m| m.add(Cuboid::new(size.x, size.y, size.z)))
-            {
-                if let Some(mut h) = world.get_mut::<Handle<Mesh>>(entity) {
-                    *h = new_mesh;
-                }
-            }
-
-            if let Some(mut tr) = world.get_mut::<Transform>(entity) {
-                tr.translation = center;
-                tr.rotation = Quat::IDENTITY;
-                tr.scale = Vec3::ONE;
-            }
-        }
-    }
-
-    if let Some(mut obj) = world.get_mut::<CadObject>(entity) {
-        obj.label = geometry.summary_text();
-        obj.geometry = geometry;
-    }
-}
-
-pub fn instantiate_cad_entity(world: &mut World, item: CadObject) -> Option<Entity> {
-    match item.geometry {
-        CadGeometryKind::Line { start, end, radius } => {
-            let vec = end - start;
-            let len = vec.length();
-            if len <= 0.0001 {
-                return None;
-            }
-
-            let mid = (start + end) * 0.5;
-            let rot = Quat::from_rotation_arc(Vec3::Y, vec / len);
-
-            let (cyl_mesh, cap_mesh) = {
-                let Some(mut meshes) = world.get_resource_mut::<Assets<Mesh>>() else {
-                    return None;
-                };
-                (
-                    meshes.add(Cylinder::new(radius, len)),
-                    meshes.add(Sphere::new(radius * 1.6)),
-                )
+            let (cyl_mesh, cap_mesh, line_mat) = {
+                let mut meshes = world.resource_mut::<Assets<Mesh>>();
+                let cyl = meshes.add(Cylinder::new(radius, length));
+                let cap = meshes.add(Sphere::new(radius * 1.25_f32));
+                let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
+                let mat = materials.add(StandardMaterial {
+                    base_color: cad_obj.material_color.0,
+                    perceptual_roughness: 0.35_f32,
+                    metallic: 0.05_f32,
+                    ..default()
+                });
+                (cyl, cap, mat)
             };
 
-            let (seg_mat, cap_mat) = {
-                let Some(mut mats) = world.get_resource_mut::<Assets<StandardMaterial>>() else {
-                    return None;
-                };
-                (
-                    mats.add(StandardMaterial {
-                        base_color: item.material_color.0,
-                        perceptual_roughness: 0.35,
-                        reflectance: 0.4,
-                        ..default()
-                    }),
-                    mats.add(StandardMaterial {
-                        base_color: Color::srgb(0.95, 0.95, 0.98),
-                        unlit: true,
-                        ..default()
-                    }),
-                )
-            };
-
-            let half = len * 0.5;
-            let root = world
+            let half_len = length * 0.5_f32;
+            let parent_entity = world
                 .spawn((
                     PbrBundle {
                         mesh: cyl_mesh,
-                        material: seg_mat,
+                        material: line_mat.clone(),
                         transform: Transform {
-                            translation: mid,
-                            rotation: rot,
+                            translation: midpoint,
+                            rotation,
                             scale: Vec3::ONE,
                         },
                         ..default()
                     },
-                    item,
+                    cad_obj.material_color,
+                    cad_obj,
                 ))
-                .with_children(|p| {
-                    p.spawn(PbrBundle {
-                        mesh: cap_mesh.clone(),
-                        material: cap_mat.clone(),
-                        transform: Transform::from_xyz(0.0, -half, 0.0),
-                        ..default()
-                    });
-                    p.spawn(PbrBundle {
-                        mesh: cap_mesh,
-                        material: cap_mat,
-                        transform: Transform::from_xyz(0.0, half, 0.0),
-                        ..default()
-                    });
-                })
                 .id();
-            Some(root)
-        }
-        CadGeometryKind::Block { center, size } => {
-            let box_mesh = {
-                let Some(mut meshes) = world.get_resource_mut::<Assets<Mesh>>() else {
-                    return None;
-                };
-                meshes.add(Cuboid::new(size.x, size.y, size.z))
-            };
 
-            let box_mat = {
-                let Some(mut mats) = world.get_resource_mut::<Assets<StandardMaterial>>() else {
-                    return None;
-                };
-                mats.add(StandardMaterial {
-                    base_color: item.material_color.0,
-                    perceptual_roughness: 0.42,
-                    metallic: 0.06,
-                    reflectance: 0.38,
+            let cap_a = world
+                .spawn(PbrBundle {
+                    mesh: cap_mesh.clone(),
+                    material: line_mat.clone(),
+                    transform: Transform::from_xyz(0.0_f32, -half_len, 0.0_f32),
                     ..default()
                 })
+                .id();
+
+            let cap_b = world
+                .spawn(PbrBundle {
+                    mesh: cap_mesh,
+                    material: line_mat,
+                    transform: Transform::from_xyz(0.0_f32, half_len, 0.0_f32),
+                    ..default()
+                })
+                .id();
+
+            world
+                .entity_mut(parent_entity)
+                .push_children(&[cap_a, cap_b]);
+            parent_entity
+        }
+        CadGeometryKind::Block { center, size } => {
+            let clamped = size.max(Vec3::splat(0.05_f32));
+            let (box_mesh, box_mat) = {
+                let mut meshes = world.resource_mut::<Assets<Mesh>>();
+                let m = meshes.add(Cuboid::from_size(clamped));
+                let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
+                let mat = materials.add(StandardMaterial {
+                    base_color: cad_obj.material_color.0,
+                    perceptual_roughness: 0.48_f32,
+                    metallic: 0.08_f32,
+                    ..default()
+                });
+                (m, mat)
             };
 
-            let root = world
+            world
                 .spawn((
                     PbrBundle {
                         mesh: box_mesh,
@@ -435,21 +296,93 @@ pub fn instantiate_cad_entity(world: &mut World, item: CadObject) -> Option<Enti
                         transform: Transform::from_translation(center),
                         ..default()
                     },
-                    item,
+                    cad_obj.material_color,
+                    cad_obj,
                 ))
-                .id();
-            Some(root)
+                .id()
         }
     }
 }
 
-#[derive(Debug)]
+pub fn apply_geometry_to_existing_entity(
+    world: &mut World,
+    target: Entity,
+    new_geometry: CadGeometryKind,
+) {
+    let existing_children: Vec<Entity> = world
+        .get::<Children>(target)
+        .map(|c| c.iter().copied().collect())
+        .unwrap_or_default();
+
+    match new_geometry {
+        CadGeometryKind::Line { start, end, radius } => {
+            let delta = end - start;
+            let length = delta.length().max(0.001_f32);
+            let midpoint = (start + end) * 0.5_f32;
+            let dir = delta / length;
+            let rotation = Quat::from_rotation_arc(Vec3::Y, dir);
+            let half_len = length * 0.5_f32;
+
+            let new_cyl_mesh = {
+                let mut meshes = world.resource_mut::<Assets<Mesh>>();
+                meshes.add(Cylinder::new(radius, length))
+            };
+
+            if let Some(mut ent_mut) = world.get_entity_mut(target) {
+                if let Some(mut obj) = ent_mut.get_mut::<CadObject>() {
+                    obj.geometry = new_geometry;
+                }
+                if let Some(mut tf) = ent_mut.get_mut::<Transform>() {
+                    tf.translation = midpoint;
+                    tf.rotation = rotation;
+                    tf.scale = Vec3::ONE;
+                }
+                if let Some(mut mesh_handle) = ent_mut.get_mut::<Handle<Mesh>>() {
+                    *mesh_handle = new_cyl_mesh;
+                }
+            }
+
+            if let Some(first_child) = existing_children.first().copied() {
+                if let Some(mut tf) = world.get_mut::<Transform>(first_child) {
+                    tf.translation = Vec3::new(0.0_f32, -half_len, 0.0_f32);
+                }
+            }
+            if let Some(second_child) = existing_children.get(1).copied() {
+                if let Some(mut tf) = world.get_mut::<Transform>(second_child) {
+                    tf.translation = Vec3::new(0.0_f32, half_len, 0.0_f32);
+                }
+            }
+        }
+        CadGeometryKind::Block { center, size } => {
+            let clamped = size.max(Vec3::splat(0.05_f32));
+            let new_box_mesh = {
+                let mut meshes = world.resource_mut::<Assets<Mesh>>();
+                meshes.add(Cuboid::from_size(clamped))
+            };
+
+            if let Some(mut ent_mut) = world.get_entity_mut(target) {
+                if let Some(mut obj) = ent_mut.get_mut::<CadObject>() {
+                    obj.geometry = new_geometry;
+                }
+                if let Some(mut tf) = ent_mut.get_mut::<Transform>() {
+                    tf.translation = center;
+                    tf.scale = Vec3::ONE;
+                }
+                if let Some(mut mesh_handle) = ent_mut.get_mut::<Handle<Mesh>>() {
+                    *mesh_handle = new_box_mesh;
+                }
+            }
+        }
+    }
+}
+
 pub struct DrawLineCommand {
-    pub start: Vec3,
-    pub end: Vec3,
-    pub color: Color,
-    pub group_id: Option<GroupId>,
-    pub spawned: Option<Entity>,
+    start: Vec3,
+    end: Vec3,
+    radius: f32,
+    color: Color,
+    group_id: Option<GroupId>,
+    spawned_entity: Option<Entity>,
 }
 
 impl DrawLineCommand {
@@ -457,50 +390,51 @@ impl DrawLineCommand {
         Self {
             start,
             end,
+            radius: 0.045_f32,
             color,
             group_id,
-            spawned: None,
+            spawned_entity: None,
         }
     }
 }
 
 impl Command for DrawLineCommand {
     fn execute(&mut self, world: &mut World) {
-        if let Some(old) = self.spawned.take() {
-            remove_cad_entity(world, old);
-        }
-        let geometry = CadGeometryKind::Line {
-            start: self.start,
-            end: self.end,
-            radius: 0.032,
-        };
+        let serial = world
+            .get_resource_mut::<NextObjectSerial>()
+            .map(|mut s| s.next_id())
+            .unwrap_or(1);
+
         let obj = CadObject {
-            label: geometry.summary_text(),
+            label: format!("Line #{serial}"),
             group_id: self.group_id,
             material_color: MaterialColor(self.color),
-            geometry,
+            geometry: CadGeometryKind::Line {
+                start: self.start,
+                end: self.end,
+                radius: self.radius,
+            },
         };
-        self.spawned = instantiate_cad_entity(world, obj);
+        self.spawned_entity = Some(instantiate_cad_entity(world, obj));
     }
 
     fn undo(&mut self, world: &mut World) {
-        if let Some(ent) = self.spawned.take() {
-            remove_cad_entity(world, ent);
+        if let Some(entity) = self.spawned_entity.take() {
+            remove_cad_entity(world, entity);
         }
     }
 
     fn description(&self) -> &'static str {
-        "Draw 3D Line"
+        "Draw Line Segment"
     }
 }
 
-#[derive(Debug)]
 pub struct CreateBlockCommand {
-    pub center: Vec3,
-    pub size: Vec3,
-    pub color: Color,
-    pub group_id: Option<GroupId>,
-    pub spawned: Option<Entity>,
+    center: Vec3,
+    size: Vec3,
+    color: Color,
+    group_id: Option<GroupId>,
+    spawned_entity: Option<Entity>,
 }
 
 impl CreateBlockCommand {
@@ -510,16 +444,30 @@ impl CreateBlockCommand {
         color: Color,
         group_id: Option<GroupId>,
     ) -> Self {
-        let lo = a.min(b);
-        let hi = a.max(b);
-        let size = (hi - lo).max(Vec3::splat(0.05));
-        let center = Vec3::new((lo.x + hi.x) * 0.5, (lo.y + hi.y) * 0.5, lo.z + size.z * 0.5);
+        let min_x = a.x.min(b.x);
+        let max_x = a.x.max(b.x).max(min_x + 0.25_f32);
+        let min_y = a.y.min(b.y);
+        let max_y = a.y.max(b.y).max(min_y + 0.25_f32);
+        let min_z = a.z.min(b.z);
+        let max_z = if (a.z - b.z).abs() < 0.1_f32 {
+            min_z + 2.0_f32
+        } else {
+            a.z.max(b.z)
+        };
+
+        let size = Vec3::new(max_x - min_x, max_y - min_y, (max_z - min_z).max(0.25_f32));
+        let center = Vec3::new(
+            (min_x + max_x) * 0.5_f32,
+            (min_y + max_y) * 0.5_f32,
+            min_z + size.z * 0.5_f32,
+        );
+
         Self {
             center,
             size,
             color,
             group_id,
-            spawned: None,
+            spawned_entity: None,
         }
     }
 
@@ -529,41 +477,44 @@ impl CreateBlockCommand {
         color: Color,
         group_id: Option<GroupId>,
     ) -> Self {
-        let far = origin + dims;
-        let lo = origin.min(far);
-        let hi = origin.max(far);
-        let size = (hi - lo).max(Vec3::splat(0.05));
+        let clamped_dims = Vec3::new(
+            dims.x.abs().max(0.1_f32),
+            dims.y.abs().max(0.1_f32),
+            dims.z.abs().max(0.1_f32),
+        );
+        let center = origin + clamped_dims * 0.5_f32;
         Self {
-            center: (lo + hi) * 0.5,
-            size,
+            center,
+            size: clamped_dims,
             color,
             group_id,
-            spawned: None,
+            spawned_entity: None,
         }
     }
 }
 
 impl Command for CreateBlockCommand {
     fn execute(&mut self, world: &mut World) {
-        if let Some(old) = self.spawned.take() {
-            remove_cad_entity(world, old);
-        }
-        let geometry = CadGeometryKind::Block {
-            center: self.center,
-            size: self.size,
-        };
+        let serial = world
+            .get_resource_mut::<NextObjectSerial>()
+            .map(|mut s| s.next_id())
+            .unwrap_or(1);
+
         let obj = CadObject {
-            label: geometry.summary_text(),
+            label: format!("Block #{serial}"),
             group_id: self.group_id,
             material_color: MaterialColor(self.color),
-            geometry,
+            geometry: CadGeometryKind::Block {
+                center: self.center,
+                size: self.size,
+            },
         };
-        self.spawned = instantiate_cad_entity(world, obj);
+        self.spawned_entity = Some(instantiate_cad_entity(world, obj));
     }
 
     fn undo(&mut self, world: &mut World) {
-        if let Some(ent) = self.spawned.take() {
-            remove_cad_entity(world, ent);
+        if let Some(entity) = self.spawned_entity.take() {
+            remove_cad_entity(world, entity);
         }
     }
 
@@ -572,14 +523,11 @@ impl Command for CreateBlockCommand {
     }
 }
 
-/// Reversible command for the Offset Tool (`[F]`): spawns a concentric set of offset line segments
-/// from a 2D face or connected edge chain and despawns all generated segments on Undo.
-#[derive(Debug)]
 pub struct CreateOffsetCommand {
-    pub segments: Vec<(Vec3, Vec3)>,
-    pub color: Color,
-    pub group_id: Option<GroupId>,
-    pub spawned_entities: Vec<Entity>,
+    segments: Vec<(Vec3, Vec3)>,
+    color: Color,
+    group_id: Option<GroupId>,
+    spawned_entities: Vec<Entity>,
 }
 
 impl CreateOffsetCommand {
@@ -599,28 +547,30 @@ impl CreateOffsetCommand {
 
 impl Command for CreateOffsetCommand {
     fn execute(&mut self, world: &mut World) {
-        for old in self.spawned_entities.drain(..) {
-            remove_cad_entity(world, old);
-        }
+        self.spawned_entities.clear();
+        let resolved_group = self.group_id.unwrap_or(GroupId(1));
 
-        for &(start, end) in &self.segments {
-            if start.distance(end) <= 0.01 {
+        for (start, end) in self.segments.clone() {
+            if start.distance(end) < 0.005_f32 {
                 continue;
             }
-            let geometry = CadGeometryKind::Line {
-                start,
-                end,
-                radius: 0.032,
-            };
+            let serial = world
+                .get_resource_mut::<NextObjectSerial>()
+                .map(|mut s| s.next_id())
+                .unwrap_or(1);
+
             let obj = CadObject {
-                label: format!("Offset {}", geometry.summary_text()),
-                group_id: self.group_id,
+                label: format!("Offset Edge #{serial}"),
+                group_id: Some(resolved_group),
                 material_color: MaterialColor(self.color),
-                geometry,
+                geometry: CadGeometryKind::Line {
+                    start,
+                    end,
+                    radius: 0.042_f32,
+                },
             };
-            if let Some(ent) = instantiate_cad_entity(world, obj) {
-                self.spawned_entities.push(ent);
-            }
+            let ent = instantiate_cad_entity(world, obj);
+            self.spawned_entities.push(ent);
         }
     }
 
@@ -631,15 +581,14 @@ impl Command for CreateOffsetCommand {
     }
 
     fn description(&self) -> &'static str {
-        "Offset Contour"
+        "Offset Coplanar Contour"
     }
 }
 
-#[derive(Debug)]
 pub struct MoveObjectCommand {
-    pub entity: Entity,
-    pub before: CadGeometryKind,
-    pub after: CadGeometryKind,
+    entity: Entity,
+    before: CadGeometryKind,
+    after: CadGeometryKind,
 }
 
 impl MoveObjectCommand {
@@ -654,11 +603,11 @@ impl MoveObjectCommand {
 
 impl Command for MoveObjectCommand {
     fn execute(&mut self, world: &mut World) {
-        apply_geometry_to_existing_entity(world, self.entity, self.after.clone());
+        apply_geometry_to_existing_entity(world, self.entity, self.after);
     }
 
     fn undo(&mut self, world: &mut World) {
-        apply_geometry_to_existing_entity(world, self.entity, self.before.clone());
+        apply_geometry_to_existing_entity(world, self.entity, self.before);
     }
 
     fn description(&self) -> &'static str {
@@ -666,11 +615,10 @@ impl Command for MoveObjectCommand {
     }
 }
 
-#[derive(Debug)]
 pub struct ScaleObjectCommand {
-    pub entity: Entity,
-    pub before: CadGeometryKind,
-    pub after: CadGeometryKind,
+    entity: Entity,
+    before: CadGeometryKind,
+    after: CadGeometryKind,
 }
 
 impl ScaleObjectCommand {
@@ -685,11 +633,11 @@ impl ScaleObjectCommand {
 
 impl Command for ScaleObjectCommand {
     fn execute(&mut self, world: &mut World) {
-        apply_geometry_to_existing_entity(world, self.entity, self.after.clone());
+        apply_geometry_to_existing_entity(world, self.entity, self.after);
     }
 
     fn undo(&mut self, world: &mut World) {
-        apply_geometry_to_existing_entity(world, self.entity, self.before.clone());
+        apply_geometry_to_existing_entity(world, self.entity, self.before);
     }
 
     fn description(&self) -> &'static str {
@@ -697,61 +645,37 @@ impl Command for ScaleObjectCommand {
     }
 }
 
-#[derive(Debug)]
 pub struct DeleteCommand {
-    pub items: Vec<(Option<Entity>, CadObject)>,
+    snapshots: Vec<(Option<Entity>, CadObject)>,
 }
 
 impl DeleteCommand {
-    pub fn new(snapshots: Vec<(Entity, CadObject)>) -> Self {
-        Self {
-            items: snapshots.into_iter().map(|(e, o)| (Some(e), o)).collect(),
-        }
+    pub fn new(items: Vec<(Entity, CadObject)>) -> Self {
+        let snapshots = items
+            .into_iter()
+            .map(|(ent, obj)| (Some(ent), obj))
+            .collect();
+        Self { snapshots }
     }
 }
 
 impl Command for DeleteCommand {
     fn execute(&mut self, world: &mut World) {
-        for (slot, _) in &mut self.items {
-            if let Some(ent) = slot.take() {
+        for (maybe_ent, _obj) in &mut self.snapshots {
+            if let Some(ent) = maybe_ent.take() {
                 remove_cad_entity(world, ent);
             }
         }
     }
 
     fn undo(&mut self, world: &mut World) {
-        for (slot, obj) in &mut self.items {
-            if let Some(old) = slot.take() {
-                remove_cad_entity(world, old);
-            }
-            *slot = instantiate_cad_entity(world, obj.clone());
+        for (maybe_ent, obj) in &mut self.snapshots {
+            let respawned = instantiate_cad_entity(world, obj.clone());
+            *maybe_ent = Some(respawned);
         }
     }
 
     fn description(&self) -> &'static str {
-        "Delete CAD Object(s)"
-    }
-}
-
-pub fn flush_history_action_queue(world: &mut World) {
-    let queued: Vec<HistoryAction> = world
-        .get_resource_mut::<PendingHistoryActions>()
-        .map(|mut q| std::mem::take(&mut q.queue))
-        .unwrap_or_default();
-
-    for action in queued {
-        let Some(mut history) = world.remove_resource::<CommandHistory>() else {
-            return;
-        };
-        match action {
-            HistoryAction::Execute(cmd) => history.execute_command(cmd, world),
-            HistoryAction::Undo => {
-                history.undo(world);
-            }
-            HistoryAction::Redo => {
-                history.redo(world);
-            }
-        }
-        world.insert_resource(history);
+        "Delete Selected Object"
     }
 }

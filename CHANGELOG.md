@@ -47,3 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * [Added] - Automatic 2D face perimeter and connected coplanar polyline chain detector (`detect_offset_contour_for_entity`) with real-time hover highlighting.
 * [Added] - Concentric 2D mitered offset solver (`OffsetContour::compute_offset_segments`) supporting interactive inward/outward LMB dragging and exact decimal VCB distance inputs (e.g., `0.3` for 30cm wall thickness).
 * [Added] - Reversible `CreateOffsetCommand` integrated with `CommandHistory` (`undo_stack` / `redo_stack`) for full `Ctrl+Z` / `Ctrl+Y` rollback support.
+
+## [0.1.3] - 2026-10-16
+
+### Fixed
+- **Strict Coplanar Local-Space Offset Projection (`src/tools.rs`)**: Projected selected 3D block faces and closed coplanar line loops into an orthonormal 2D `(U, V)` local basis (`OffsetContour`), computing inward/outward parallel edge shifts and 2D miter intersections (`intersect_uv_miter`) with self-intersection clamping.
+- **Vertex-to-Face Flush Binding (`src/tools.rs`)**: Added `OffsetContour::bind_uv_flush_to_plane` to eliminate normal drift and lock generated 3D offset segments strictly flush to the source face plane.
+- **Cross-Module Signature Synchronization (`src/commands.rs`, `src/tools.rs`, `src/ui.rs`)**: Unified `CommandHistory::execute_command`, `Option<GroupId>` command constructors, `MoveToolState`/`ScaleToolState` drag sessions, and `VcbInput` state across all four modules, and resolved the `E0502` borrow conflict in `handle_offset_tool_interaction`.
