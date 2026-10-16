@@ -5,7 +5,8 @@ use bevy_egui::{egui, EguiContexts};
 use crate::commands::{CadGeometryKind, CadObject, CommandHistory, DeleteCommand};
 use crate::tools::{
     ActiveToolState, AxisInference, CadTool, CursorRayState, FocalPoint, MoveToolState,
-    OffsetToolState, ScaleToolState, SelectedCadObjects, SnapAxisKind, ToolDraftState, VcbInput,
+    OffsetToolState, PushPullToolState, ScaleToolState, SelectedCadObjects, SnapAxisKind,
+    ToolDraftState, VcbInput,
 };
 
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
@@ -26,6 +27,7 @@ fn draw_draftdown_ui(
     mut move_state: ResMut<MoveToolState>,
     mut scale_state: ResMut<ScaleToolState>,
     mut offset_state: ResMut<OffsetToolState>,
+    mut push_pull_state: ResMut<PushPullToolState>,
     mut selected: ResMut<SelectedCadObjects>,
     cursor_state: Res<CursorRayState>,
     focal_point: Res<FocalPoint>,
@@ -69,6 +71,7 @@ fn draw_draftdown_ui(
                     SnapAxisKind::RedX => egui::Color32::from_rgb(235, 65, 70),
                     SnapAxisKind::GreenY => egui::Color32::from_rgb(55, 210, 95),
                     SnapAxisKind::BlueZ => egui::Color32::from_rgb(65, 145, 250),
+                    SnapAxisKind::Diagonal45 => egui::Color32::from_rgb(255, 235, 40),
                     SnapAxisKind::ParallelNeighbor => egui::Color32::from_rgb(245, 75, 230),
                     SnapAxisKind::None => egui::Color32::from_rgb(185, 190, 200),
                 };
@@ -87,6 +90,18 @@ fn draw_draftdown_ui(
                         ))
                         .strong()
                         .color(egui::Color32::from_rgb(255, 175, 45)),
+                    );
+                }
+
+                if active_tool.current == CadTool::PushPullExtrude && push_pull_state.is_dragging {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Extrude: {:+.2} m",
+                            push_pull_state.current_extrude_distance
+                        ))
+                        .strong()
+                        .color(egui::Color32::from_rgb(45, 240, 210)),
                     );
                 }
 
@@ -176,6 +191,8 @@ fn draw_draftdown_ui(
                     move_state.active_drag = None;
                     scale_state.active_drag = None;
                     offset_state.reset_drag();
+                    push_pull_state.reset_drag();
+                    push_pull_state.hovered_face = None;
                 }
             }
 
@@ -276,21 +293,22 @@ fn draw_draftdown_ui(
             )
             .default_open(true)
             .show(ui, |ui| {
-                ui.label("Space : Select Tool");
-                ui.label("L : Line Tool (Continuous Chain)");
-                ui.label("B : 3D Block / Box Tool");
-                ui.label("M : Move Tool (Translate)");
-                ui.label("S : Scale Tool (8-Handle Box)");
-                ui.label("F : Offset Tool (Coplanar 2D UV)");
-                ui.label("Hold Shift : Lock Blue (Z) Axis");
-                ui.label("MMB Drag : Orbit Targeted Object");
-                ui.label("Shift + MMB : Pan Focal Pivot");
-                ui.label("Scroll : Smooth Zoom");
-                ui.label("0-9 / , / Enter : VCB Dimensions");
-                ui.label("Del / Backspace : Delete Object");
-                ui.label("Esc : Break Chain / Cancel Drag");
-                ui.label("Ctrl+Z / Ctrl+Y : Undo / Redo");
-                ui.label("Ctrl+Q : Exit Application");
+                ui.label("[Space] - Select Tool");
+                ui.label("[L] - Line Tool (45° & Axis Snap)");
+                ui.label("[B] - 3D Block / Box Tool");
+                ui.label("[M] - Move Tool (Translate)");
+                ui.label("[S] - Scale Tool (8-Handle Box)");
+                ui.label("[F] - Offset Tool (Coplanar 2D UV)");
+                ui.label("[P] - Push/Pull Tool");
+                ui.label("[Hold Shift] - Lock Blue (Z) Axis");
+                ui.label("[MMB Drag] - Orbit Targeted Object");
+                ui.label("[Shift + MMB] - Pan Focal Pivot");
+                ui.label("[Scroll] - Smooth Zoom");
+                ui.label("[0-9 / , / Enter] - VCB Dimensions");
+                ui.label("[Del / Backspace] - Delete Object");
+                ui.label("[Esc] - Break Chain / Cancel Drag");
+                ui.label("[Ctrl+Z / Ctrl+Y] - Undo / Redo");
+                ui.label("[Ctrl+Q] - Exit Application");
             });
 
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {

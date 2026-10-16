@@ -54,3 +54,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Strict Coplanar Local-Space Offset Projection (`src/tools.rs`)**: Projected selected 3D block faces and closed coplanar line loops into an orthonormal 2D `(U, V)` local basis (`OffsetContour`), computing inward/outward parallel edge shifts and 2D miter intersections (`intersect_uv_miter`) with self-intersection clamping.
 - **Vertex-to-Face Flush Binding (`src/tools.rs`)**: Added `OffsetContour::bind_uv_flush_to_plane` to eliminate normal drift and lock generated 3D offset segments strictly flush to the source face plane.
 - **Cross-Module Signature Synchronization (`src/commands.rs`, `src/tools.rs`, `src/ui.rs`)**: Unified `CommandHistory::execute_command`, `Option<GroupId>` command constructors, `MoveToolState`/`ScaleToolState` drag sessions, and `VcbInput` state across all four modules, and resolved the `E0502` borrow conflict in `handle_offset_tool_interaction`.
+
+## [0.1.4] — 2026-10-16
+
+### Added
+- **Push/Pull (`P`) Extrusion Engine (`src/tools.rs`, `src/commands.rs`, `src/ui.rs`)**: Implemented interactive 3D face extrusion mapped to the `P` hotkey and left toolbar. Hovering over any 3D block face or closed coplanar edge loop renders a dotted surface pattern overlay (`sample_interior_dots_3d`), normal indicator arrow, and emissive material highlight. Clicking and dragging `LMB` extrudes the face along its normal vector in real time while generating boundary side-wall segments, and typing a numeric distance (e.g., `2.5` + `Enter`) in the VCB commits a reversible `PushPullCommand`.
+- **45-Degree Diagonal Line Angle Snapping (`src/tools.rs`, `src/ui.rs`)**: Added `evaluate_diagonal_45_snap` and `SnapAxisKind::Diagonal45` to the Line Tool inference engine, snapping within a `2.0°` tolerance of `45°`, `135°`, `225°`, and `315°` relative to the starting vertex and rendering an infinite-span bright Yellow dashed guide line (`DIAGONAL_YELLOW_COLOR`).
+- **Hotkeys Cheat Sheet Update (`src/ui.rs`)**: Added `[P] - Push/Pull Tool` and updated the `Line Tool` description in the permanently visible left-panel Hotkeys Cheat Sheet.
+
+### Fixed
+- **Exact Raycast Face Selection for Offset Tool (`src/tools.rs`)**: Implemented `raycast_block_face_exact` with front-face normal culling (`ray_dir.dot(normal) < 0.0`) and 2D face-bounds testing so hovering over a 3D block deterministically locks `OffsetContour` onto the exact hit polygon normal and plane altitude (such as `Dir3::Z` at `max.z` for top covers) without falling back to synthetic line rectangles.

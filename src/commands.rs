@@ -66,6 +66,47 @@ impl CadGeometryKind {
             },
         }
     }
+
+    pub fn extruded_along_face(&self, normal: Dir3, distance: f32) -> Self {
+        match *self {
+            Self::Line { start, end, radius } => {
+                let shift = normal.as_vec3() * distance;
+                Self::Line {
+                    start: start + shift,
+                    end: end + shift,
+                    radius,
+                }
+            }
+            Self::Block { center, size } => {
+                let half = size * 0.5_f32;
+                let mut min = center - half;
+                let mut max = center + half;
+                let n = normal.as_vec3();
+                let min_thickness = 0.1_f32;
+
+                if n.z > 0.9_f32 {
+                    max.z = (max.z + distance).max(min.z + min_thickness);
+                } else if n.z < -0.9_f32 {
+                    min.z = (min.z - distance).min(max.z - min_thickness);
+                } else if n.x > 0.9_f32 {
+                    max.x = (max.x + distance).max(min.x + min_thickness);
+                } else if n.x < -0.9_f32 {
+                    min.x = (min.x - distance).min(max.x - min_thickness);
+                } else if n.y > 0.9_f32 {
+                    max.y = (max.y + distance).max(min.y + min_thickness);
+                } else if n.y < -0.9_f32 {
+                    min.y = (min.y - distance).min(max.y - min_thickness);
+                }
+
+                let new_size = (max - min).max(Vec3::splat(min_thickness));
+                let new_center = (min + max) * 0.5_f32;
+                Self::Block {
+                    center: new_center,
+                    size: new_size,
+                }
+            }
+        }
+    }
 }
 
 #[derive(Component, Debug, Clone)]
@@ -582,6 +623,145 @@ impl Command for CreateOffsetCommand {
 
     fn description(&self) -> &'static str {
         "Offset Coplanar Contour"
+    }
+}
+
+pub struct PushPullCommand {
+    target_entity: Option<Entity>,
+    before_geometry: Option<CadGeometryKind>,
+    after_geometry: Option<CadGeometryKind>,
+    extruded_solid_block: Option<(Vec3, Vec3)>,
+    boundary_wall_segments: Vec<(Vec3, Vec3)>,
+    color: Color,
+    group_id: Option<GroupId>,
+    spawned_entities: Vec<Entity>,
+}
+
+impl PushPullCommand {
+    pub fn for_block_face(
+        entity: Entity,
+        before: CadGeometryKind,
+        after: CadGeometryKind,
+        boundary_wall_segments: Vec<(Vec3, Vec3)>,
+        color: Color,
+        group_id: Option<GroupId>,
+    ) -> Self {
+        Self {
+            target_entity: Some(entity),
+            before_geometry: Some(before),
+            after_geometry: Some(after),
+            extruded_solid_block: None,
+            boundary_wall_segments,
+            color,
+            group_id,
+            spawned_entities: Vec::new(),
+        }
+    }
+
+    pub fn for_closed_face_loop(
+        base_vertices: &[Vec3],
+        normal: Dir3,
+        distance: f32,
+        color: Color,
+        group_id: Option<GroupId>,
+    ) -> Self {
+        let shift = normal.as_vec3() * distance;
+        let count = base_vertices.len();
+        let mut wall_segments = Vec::with_capacity(count * 2);
+
+        let mut min_pt = Vec3::splat(f32::MAX);
+        let mut max_pt = Vec3::splat(f32::MIN);
+
+        for i in 0..count {
+            let b0 = base_vertices[i];
+            let b1 = base_vertices[(i + 1) % count];
+            let t0 = b0 + shift;
+            let t1 = b1 + shift;
+
+            wall_segments.push((b0, t0));
+            wall_segments.push((t0, t1));
+
+            min_pt = min_pt.min(b0).min(t0);
+            max_pt = max_pt.max(b0).max(t0);
+        }
+
+        let span = (max_pt - min_pt).max(Vec3::splat(0.1_f32));
+        let center = (min_pt + max_pt) * 0.5_f32;
+
+        Self {
+            target_entity: None,
+            before_geometry: None,
+            after_geometry: None,
+            extruded_solid_block: Some((center, span)),
+            boundary_wall_segments: wall_segments,
+            color,
+            group_id,
+            spawned_entities: Vec::new(),
+        }
+    }
+}
+
+impl Command for PushPullCommand {
+    fn execute(&mut self, world: &mut World) {
+        self.spawned_entities.clear();
+
+        if let (Some(entity), Some(after)) = (self.target_entity, self.after_geometry) {
+            apply_geometry_to_existing_entity(world, entity, after);
+        }
+
+        if let Some((center, size)) = self.extruded_solid_block {
+            let serial = world
+                .get_resource_mut::<NextObjectSerial>()
+                .map(|mut s| s.next_id())
+                .unwrap_or(1);
+
+            let block_obj = CadObject {
+                label: format!("Extruded Block #{serial}"),
+                group_id: self.group_id,
+                material_color: MaterialColor(self.color),
+                geometry: CadGeometryKind::Block { center, size },
+            };
+            let ent = instantiate_cad_entity(world, block_obj);
+            self.spawned_entities.push(ent);
+        }
+
+        let wall_color = Color::srgb(0.86, 0.90, 0.96);
+        for (start, end) in self.boundary_wall_segments.clone() {
+            if start.distance(end) < 0.01_f32 {
+                continue;
+            }
+            let serial = world
+                .get_resource_mut::<NextObjectSerial>()
+                .map(|mut s| s.next_id())
+                .unwrap_or(1);
+
+            let wall_edge = CadObject {
+                label: format!("Extrude Wall Edge #{serial}"),
+                group_id: self.group_id,
+                material_color: MaterialColor(wall_color),
+                geometry: CadGeometryKind::Line {
+                    start,
+                    end,
+                    radius: 0.036_f32,
+                },
+            };
+            let ent = instantiate_cad_entity(world, wall_edge);
+            self.spawned_entities.push(ent);
+        }
+    }
+
+    fn undo(&mut self, world: &mut World) {
+        for ent in self.spawned_entities.drain(..) {
+            remove_cad_entity(world, ent);
+        }
+
+        if let (Some(entity), Some(before)) = (self.target_entity, self.before_geometry) {
+            apply_geometry_to_existing_entity(world, entity, before);
+        }
+    }
+
+    fn description(&self) -> &'static str {
+        "Push/Pull Extrude Face"
     }
 }
 

@@ -99,7 +99,8 @@ WINIT_UNIX_BACKEND=wayland cargo run
 | `Ctrl + Y` / `Ctrl + Shift + Z` | Redo Command |
 | `Escape` | Cancel Active Operation / Break Line Chain |
 | `Ctrl + Q` | Exit Application Cleanly |
-| F | Offset
+| F | Offset |
+| `P` | Activate **Push/Pull** face extrusion tool (real-time drag or VCB distance) |
 
 ## License
 
