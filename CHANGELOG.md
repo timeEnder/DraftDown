@@ -76,3 +76,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **Solid Manifold Side-Wall Seam Stitching in Push/Pull (`src/commands.rs`, `src/tools.rs`)**: Replaced standalone wireframe edge spawning in `PushPullCommand` with `build_stitched_extrusion_mesh` and `apply_stitched_extrusion_to_block_entity`. Extruding a block face or closed polygon loop now caches the initial perimeter boundary loop and dynamically stitches the 4 side-wall quads (8 triangles) plus top and bottom cap polygons into a closed, watertight 3D manifold `Mesh` (`PrimitiveTopology::TriangleList`).
 - **Outward Normal Winding & VCB Face State Sync (`src/commands.rs`, `src/tools.rs`)**: Enforced counter-clockwise (CCW) vertex winding via Newell normal alignment and centroid dot-product verification so all stitched side-wall and cap normals point strictly outwards in Bevy's PBR renderer, and updated `last_selected_face` after VCB commits so consecutive extrusions (e.g., `1.5` + `Enter`) advance cleanly from the newly extruded face.
+
+## [0.1.7] - 2026-10-17
+
+### Changed
+- **In-Place Face Splitting in `CreateOffsetCommand` (`src/commands.rs`, `src/tools.rs`)**: Committing an offset contour onto a 3D `Block` face now intercepts the parent block's `EditableBlockTopology` component instead of spawning independent `Offset Edge` line entities. The target face is re-triangulated in-place into selectable `SubFaceRegionKind::InnerLoop` (2-triangle inner quad) and `SubFaceRegionKind::OuterFrame` (8-triangle mitered annular frame ring) sub-faces on the same parent entity.
+- **Annular Sub-Face Highlighting (`src/tools.rs`)**: Added `raycast_subdivided_face_regions` and `OffsetContour::sample_annular_dots_3d` so hovering over a subdivided block face with the Push/Pull tool independently highlights either the inner offset sub-face or the surrounding outer frame ring.
+
+### Fixed
+- **Solid Manifold Sub-Face Push/Pull Extrusion (`src/commands.rs`, `src/tools.rs`)**: Rewrote `PushPullCommand` (`for_block_subface`) and `build_manifold_block_mesh_with_topology` to directly deform the parent block's vertex and index buffers when extruding or recessing a sub-face via mouse drag or VCB input, dynamically stitching interior cavity walls and exterior boss walls into a single watertight manifold mesh.
