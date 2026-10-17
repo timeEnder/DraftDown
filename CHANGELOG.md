@@ -91,3 +91,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **Dynamic Coplanar Topo-Graph Reconstruction for Offset Tool (`src/tools.rs`, `src/commands.rs`)**: Rewrote `detect_offset_contour_for_entity` to query the live, mutated Bevy `Mesh` vertex and index buffers (`extract_world_triangles_from_bevy_mesh`) via Möller–Trumbore ray-triangle intersection (`raycast_triangle_moller_trumbore`) rather than reading cached initial block bounds. Added a 2D directed half-edge boundary solver (`reconstruct_coplanar_outer_boundary_loop`) that filters connected coplanar triangles on the hit plane, cancels shared interior triangulation diagonals, and reconstructs the exact outermost boundary loop on extruded bosses, recessed pockets, and ledges.
 - **Scale-Awakened Local Basis & World-Space Manifold Face Soup (`src/commands.rs`, `src/tools.rs`)**: Applied full `Transform` (`translation`, `rotation`, and non-uniform `scale`) during live mesh triangle extraction and unified `EditableBlockTopology` around `ManifoldPolygonFace` entries so subsequent whole-face or sub-face extrusions never detach existing face subdivisions.
+
+## [0.1.9] - 2026-10-17
+
+### Fixed
+- **Miter Self-Intersection Clamping (`src/tools.rs`)**: Enhanced `OffsetContour::compute_offset_segments` and `intersect_uv_miter` to measure each candidate offset vertex's displacement and projection along its two connected source edges, clamping corner miter movement before adjacent offset vectors can cross or invert in tight corners.
+- **Annular Frame Clearance & Pocket Collapse Protection (`src/tools.rs`, `src/commands.rs`)**: Added `with_hole_clearance_limit` and zero-area edge-collapse clamping so inward offsets on extruded frame rings cannot cross over recessed pocket boundaries or seal existing inner holes during face subdivision.
+- **Flush Post-Extrusion UV-to-3D Plane Binding (`src/tools.rs`)**: Preserved canonical local `(U, V)` coordinates during vertex-snapped offset drags and projected clamped offset loops strictly flush to the mutated post-extrusion face plane without recursive scale drift.

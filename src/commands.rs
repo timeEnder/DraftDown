@@ -342,19 +342,26 @@ impl EditableBlockTopology {
         let offset_ccw = align_inner_loop_to_outer(&base_ccw, &offset_loop, n_vec);
 
         if signed_distance <= 0.0_f32 {
-            if let Some(idx) = self.find_matching_face_index(face_normal, &base_ccw) {
-                self.faces[idx].inner_holes.push(offset_ccw);
-            } else {
-                self.faces.push(ManifoldPolygonFace {
-                    normal: face_normal,
-                    outer_loop: base_ccw,
-                    inner_holes: vec![offset_ccw],
-                });
-            }
+            let inherited_holes =
+                if let Some(idx) = self.find_matching_face_index(face_normal, &base_ccw) {
+                    let prev_holes = std::mem::replace(
+                        &mut self.faces[idx].inner_holes,
+                        vec![offset_ccw],
+                    );
+                    prev_holes
+                } else {
+                    self.faces.push(ManifoldPolygonFace {
+                        normal: face_normal,
+                        outer_loop: base_ccw,
+                        inner_holes: vec![offset_ccw],
+                    });
+                    Vec::new()
+                };
+
             self.faces.push(ManifoldPolygonFace {
                 normal: face_normal,
                 outer_loop: offset_ccw,
-                inner_holes: Vec::new(),
+                inner_holes: inherited_holes,
             });
         } else {
             self.faces.push(ManifoldPolygonFace {

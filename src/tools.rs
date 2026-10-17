@@ -412,6 +412,7 @@ pub struct OffsetContour {
     pub bitangent_v: Vec3,
     pub vertices_uv: Vec<Vec2>,
     pub winding_sign: f32,
+    pub max_inward_offset: f32,
     pub group_id: Option<GroupId>,
     pub snapped_vertex: Option<Vec3>,
 }
@@ -496,11 +497,16 @@ impl OffsetContour {
         let (tangent_u, bitangent_v) = build_orthonormal_uv_basis(normal_vec);
 
         let mut vertices_uv = Vec::with_capacity(vertices_3d.len());
+        let mut min_uv = Vec2::splat(f32::MAX);
+        let mut max_uv = Vec2::splat(f32::MIN);
         for v in vertices_3d {
             let rel = *v - plane_origin;
             let u = rel.dot(tangent_u);
             let v_coord = rel.dot(bitangent_v);
-            vertices_uv.push(Vec2::new(u, v_coord));
+            let uv = Vec2::new(u, v_coord);
+            min_uv = min_uv.min(uv);
+            max_uv = max_uv.max(uv);
+            vertices_uv.push(uv);
         }
 
         let signed_area_2x = compute_polygon_signed_area_2x(&vertices_uv);
@@ -513,6 +519,18 @@ impl OffsetContour {
             -1.0_f32
         };
 
+        let mut min_edge_len = f32::MAX;
+        let count = vertices_uv.len();
+        for i in 0..count {
+            let edge_len = vertices_uv[i].distance(vertices_uv[(i + 1) % count]);
+            if edge_len < min_edge_len {
+                min_edge_len = edge_len;
+            }
+        }
+        let bbox_span = max_uv - min_uv;
+        let min_span = min_edge_len.min(bbox_span.x).min(bbox_span.y);
+        let max_inward_offset = (min_span * 0.5_f32 - 0.04_f32).max(0.02_f32);
+
         Some(Self {
             plane_origin,
             plane_normal,
@@ -520,18 +538,39 @@ impl OffsetContour {
             bitangent_v,
             vertices_uv,
             winding_sign,
+            max_inward_offset,
             group_id,
             snapped_vertex: None,
         })
     }
 
+    pub fn with_hole_clearance_limit(mut self, hole_vertices_3d: &[Vec3]) -> Self {
+        let count = self.vertices_uv.len();
+        if count < 3 || hole_vertices_3d.len() < 3 {
+            return self;
+        }
+        let mut min_clearance = f32::MAX;
+        for hv in hole_vertices_3d {
+            let huv = self.project_world_to_uv(*hv);
+            for i in 0..count {
+                let a = self.vertices_uv[i];
+                let b = self.vertices_uv[(i + 1) % count];
+                let d = point_to_segment_dist_2d(huv, a, b);
+                if d < min_clearance {
+                    min_clearance = d;
+                }
+            }
+        }
+        if min_clearance < f32::MAX {
+            let allowed = (min_clearance - 0.04_f32).max(0.02_f32);
+            self.max_inward_offset = self.max_inward_offset.min(allowed);
+        }
+        self
+    }
+
     pub fn with_vertex_zero_origin(mut self, vertex_3d: Vec3) -> Self {
         let vertex_uv = self.project_world_to_uv(vertex_3d);
         let flush_vertex = self.bind_uv_flush_to_plane(vertex_uv);
-        for uv in &mut self.vertices_uv {
-            *uv -= vertex_uv;
-        }
-        self.plane_origin = flush_vertex;
         self.snapped_vertex = Some(flush_vertex);
         self
     }
@@ -618,10 +657,6 @@ impl OffsetContour {
             return 0.0_f32;
         }
 
-        if self.snapped_vertex.is_some() && cursor_uv.length() < 0.015_f32 {
-            return 0.0_f32;
-        }
-
         let mut min_dist = f32::MAX;
         for i in 0..count {
             let a = self.vertices_uv[i];
@@ -634,9 +669,17 @@ impl OffsetContour {
 
         let inside = is_point_inside_polygon_2d(cursor_uv, &self.vertices_uv);
         if inside {
-            -min_dist
+            (-min_dist).max(-self.max_inward_offset)
         } else {
             min_dist
+        }
+    }
+
+    pub fn clamp_signed_offset(&self, requested_distance: f32) -> f32 {
+        if requested_distance < 0.0_f32 {
+            requested_distance.max(-self.max_inward_offset)
+        } else {
+            requested_distance
         }
     }
 
@@ -646,6 +689,9 @@ impl OffsetContour {
             return Vec::new();
         }
 
+        let clamped_distance = self.clamp_signed_offset(signed_distance);
+
+        let mut edge_lengths: Vec<f32> = Vec::with_capacity(count);
         let mut shifted_lines: Vec<(Vec2, Vec2)> = Vec::with_capacity(count);
         for i in 0..count {
             let p0 = self.vertices_uv[i];
@@ -655,39 +701,59 @@ impl OffsetContour {
             if len < MIN_UV_EDGE_LEN {
                 return Vec::new();
             }
+            edge_lengths.push(len);
             let dir = delta / len;
             let outward_normal = Vec2::new(dir.y, -dir.x) * self.winding_sign;
-            let shift = outward_normal * signed_distance;
+            let shift = outward_normal * clamped_distance;
             shifted_lines.push((p0 + shift, dir));
         }
 
         let mut offset_uv: Vec<Vec2> = Vec::with_capacity(count);
         for i in 0..count {
             let prev_idx = (i + count - 1) % count;
+            let orig_vertex = self.vertices_uv[i];
+            let prev_len = edge_lengths[prev_idx];
+            let curr_len = edge_lengths[i];
             let (p_prev, d_prev) = shifted_lines[prev_idx];
             let (p_curr, d_curr) = shifted_lines[i];
             let miter_uv = intersect_uv_miter(
+                orig_vertex,
+                prev_len,
+                curr_len,
                 p_prev,
                 d_prev,
                 p_curr,
                 d_curr,
-                signed_distance.abs(),
+                clamped_distance,
             );
             offset_uv.push(miter_uv);
         }
 
-        if signed_distance < 0.0_f32 {
+        // Prevent edge inversion or zero-area pocket self-intersection by clamping collapsing edges
+        if clamped_distance < 0.0_f32 {
+            let mut centroid_uv = Vec2::ZERO;
+            for uv in &self.vertices_uv {
+                centroid_uv += *uv;
+            }
+            centroid_uv /= count as f32;
+
+            for i in 0..count {
+                let next_i = (i + 1) % count;
+                let orig_edge = self.vertices_uv[next_i] - self.vertices_uv[i];
+                let new_edge = offset_uv[next_i] - offset_uv[i];
+                if orig_edge.dot(new_edge) <= 0.0005_f32 {
+                    let mid = (offset_uv[i] + offset_uv[next_i]) * 0.5_f32;
+                    let safe_half = orig_edge.normalize_or_zero() * 0.015_f32;
+                    offset_uv[i] = mid - safe_half;
+                    offset_uv[next_i] = mid + safe_half;
+                }
+            }
+
             let orig_area = compute_polygon_signed_area_2x(&self.vertices_uv);
             let new_area = compute_polygon_signed_area_2x(&offset_uv);
             if orig_area * new_area <= 1e-5_f32 {
-                return Vec::new();
-            }
-            for i in 0..count {
-                let orig_edge =
-                    self.vertices_uv[(i + 1) % count] - self.vertices_uv[i];
-                let new_edge = offset_uv[(i + 1) % count] - offset_uv[i];
-                if orig_edge.dot(new_edge) <= 0.0_f32 {
-                    return Vec::new();
+                for i in 0..count {
+                    offset_uv[i] = centroid_uv + (self.vertices_uv[i] - centroid_uv) * 0.08_f32;
                 }
             }
         }
@@ -785,26 +851,72 @@ fn compute_polygon_signed_area_2x(pts: &[Vec2]) -> f32 {
 }
 
 fn intersect_uv_miter(
+    orig_vertex: Vec2,
+    prev_edge_len: f32,
+    curr_edge_len: f32,
     p1: Vec2,
     d1: Vec2,
     p2: Vec2,
     d2: Vec2,
-    abs_offset: f32,
+    signed_distance: f32,
 ) -> Vec2 {
+    let abs_offset = signed_distance.abs();
     let cross = d1.x * d2.y - d1.y * d2.x;
     let dot = d1.dot(d2);
-    if cross.abs() < 1e-5_f32 || dot < MITER_DOT_LIMIT {
-        return (p1 + p2) * 0.5_f32;
-    }
-    let delta = p2 - p1;
-    let t = (delta.x * d2.y - delta.y * d2.x) / cross;
-    let candidate = p1 + d1 * t;
-    let max_miter = (abs_offset * MITER_MAX_MULTIPLIER).max(0.25_f32);
-    if candidate.distance(p2) > max_miter {
+    let raw_candidate = if cross.abs() < 1e-5_f32 || dot < MITER_DOT_LIMIT {
         (p1 + p2) * 0.5_f32
     } else {
-        candidate
+        let delta = p2 - p1;
+        let t = (delta.x * d2.y - delta.y * d2.x) / cross;
+        let candidate = p1 + d1 * t;
+        let max_miter = (abs_offset * MITER_MAX_MULTIPLIER).max(0.25_f32);
+        if candidate.distance(p2) > max_miter {
+            (p1 + p2) * 0.5_f32
+        } else {
+            candidate
+        }
+    };
+
+    if signed_distance >= 0.0_f32 {
+        return raw_candidate;
     }
+
+    // Miter Self-Intersection Clamping for inward offsets:
+    // Calculate the displacement vector and distance from the original vertex to the new offset vertex.
+    let miter_vec = raw_candidate - orig_vertex;
+    let miter_dist = miter_vec.length();
+    if miter_dist < 1e-6_f32 {
+        return raw_candidate;
+    }
+
+    // Projection of the miter movement along the two connected source edges (-d1 and +d2)
+    let proj_along_prev = miter_vec.dot(-d1).max(0.0_f32);
+    let proj_along_curr = miter_vec.dot(d2).max(0.0_f32);
+
+    let max_allowable_prev = (prev_edge_len * 0.5_f32 - 0.02_f32).max(0.01_f32);
+    let max_allowable_curr = (curr_edge_len * 0.5_f32 - 0.02_f32).max(0.01_f32);
+    let max_allowable_radial =
+        (prev_edge_len.min(curr_edge_len) * 0.5_f32 * std::f32::consts::SQRT_2 - 0.02_f32)
+            .max(0.015_f32);
+
+    let scale_prev = if proj_along_prev > max_allowable_prev {
+        max_allowable_prev / proj_along_prev
+    } else {
+        1.0_f32
+    };
+    let scale_curr = if proj_along_curr > max_allowable_curr {
+        max_allowable_curr / proj_along_curr
+    } else {
+        1.0_f32
+    };
+    let scale_radial = if miter_dist > max_allowable_radial {
+        max_allowable_radial / miter_dist
+    } else {
+        1.0_f32
+    };
+
+    let clamp_factor = scale_prev.min(scale_curr).min(scale_radial).clamp(0.0_f32, 1.0_f32);
+    orig_vertex + miter_vec * clamp_factor
 }
 
 fn point_to_segment_dist_2d(p: Vec2, a: Vec2, b: Vec2) -> f32 {
@@ -2740,6 +2852,7 @@ pub fn detect_offset_contour_for_entity(
                             let is_unit_scale =
                                 (scale_aware_tf.scale - Vec3::ONE).length() < 0.005_f32;
                             if is_unit_scale {
+                                // 1. Check un-holed sub-faces on this plane first
                                 for face in &topo.faces {
                                     if face.normal.as_vec3().dot(seed_normal_vec) > 0.99_f32
                                         && face.inner_holes.is_empty()
@@ -2755,6 +2868,32 @@ pub fn detect_offset_contour_for_entity(
                                             if plane_dist <= 0.008_f32 {
                                                 let uv = c.project_world_to_uv(hit_point);
                                                 if is_point_inside_polygon_2d(uv, &c.vertices_uv) {
+                                                    return Some((closest_t, c));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // 2. Check annular frame faces (with inner_holes) and bind hole clearance clamping
+                                for face in &topo.faces {
+                                    if face.normal.as_vec3().dot(seed_normal_vec) > 0.99_f32
+                                        && !face.inner_holes.is_empty()
+                                    {
+                                        if let Some(mut c) = OffsetContour::from_coplanar_loop_3d(
+                                            &face.outer_loop,
+                                            Some(face.normal),
+                                            obj.group_id,
+                                        ) {
+                                            let plane_dist = (hit_point - c.plane_origin)
+                                                .dot(seed_normal_vec)
+                                                .abs();
+                                            if plane_dist <= 0.008_f32 {
+                                                let uv = c.project_world_to_uv(hit_point);
+                                                if is_point_inside_polygon_2d(uv, &c.vertices_uv) {
+                                                    if let Some(hole) = face.inner_holes.last() {
+                                                        c = c.with_hole_clearance_limit(hole);
+                                                    }
                                                     return Some((closest_t, c));
                                                 }
                                             }
@@ -2869,7 +3008,7 @@ fn collect_object_snap_vertices_world(
             let tris = extract_world_triangles_from_bevy_mesh(bevy_mesh, transform);
             let mut unique: Vec<Vec3> = Vec::new();
             for (a, b, c, _) in tris {
-                for v in [a, b, c, (a + b) * 0.5_f32, (b + c) * 0.5_f32, (c + a) * 0.5_f32] {
+                for v in [a, b, c] {
                     if !unique.iter().any(|u| u.distance(v) < 0.01_f32) {
                         unique.push(v);
                     }
@@ -3174,8 +3313,9 @@ fn handle_offset_tool_interaction(
                 .map(|hit_3d| {
                     let adjusted_uv = contour.project_world_to_uv(hit_3d) + uv_correction;
                     let raw_offset = contour.signed_offset_from_uv(adjusted_uv);
-                    let snapped_offset =
+                    let snapped_raw =
                         (raw_offset / OFFSET_SNAP_STEP).round() * OFFSET_SNAP_STEP;
+                    let snapped_offset = contour.clamp_signed_offset(snapped_raw);
                     let segments = contour.compute_offset_segments(snapped_offset);
                     (snapped_offset, segments)
                 })
