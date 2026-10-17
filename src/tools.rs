@@ -273,6 +273,7 @@ impl Default for CursorRayState {
 #[derive(Resource, Debug, Default)]
 pub struct SelectedCadObjects {
     pub entities: Vec<Entity>,
+    pub isolated_subface: Option<(Entity, usize, SubFaceRegionKind)>,
 }
 
 impl SelectedCadObjects {
@@ -283,10 +284,33 @@ impl SelectedCadObjects {
     pub fn select_single(&mut self, entity: Entity) {
         self.entities.clear();
         self.entities.push(entity);
+        self.isolated_subface = None;
+    }
+
+    pub fn select_subface(
+        &mut self,
+        entity: Entity,
+        subface_id: usize,
+        region_kind: SubFaceRegionKind,
+    ) {
+        self.entities.clear();
+        self.entities.push(entity);
+        self.isolated_subface = Some((entity, subface_id, region_kind));
+    }
+
+    pub fn isolated_subface_for(&self, entity: Entity) -> Option<(usize, SubFaceRegionKind)> {
+        self.isolated_subface.and_then(|(ent, sid, kind)| {
+            if ent == entity {
+                Some((sid, kind))
+            } else {
+                None
+            }
+        })
     }
 
     pub fn clear(&mut self) {
         self.entities.clear();
+        self.isolated_subface = None;
     }
 
     pub fn contains(&self, entity: Entity) -> bool {
@@ -975,6 +999,7 @@ impl OffsetToolState {
 #[derive(Debug, Clone)]
 pub struct ExtrudableFace {
     pub entity: Entity,
+    pub subface_id: usize,
     pub is_block_face: bool,
     pub region_kind: SubFaceRegionKind,
     pub original_object: CadObject,
@@ -1745,20 +1770,101 @@ fn evaluate_axis_and_neighbor_snapping(
     (grid_snapped_target, SnapAxisKind::None, None, None)
 }
 
+fn clear_all_subface_highlights(
+    cad_objects: &mut Query<(Entity, &mut CadObject)>,
+    topologies: &mut Query<&mut EditableBlockTopology>,
+    mesh_handles: &mut Query<&mut Handle<Mesh>>,
+    meshes: &mut Assets<Mesh>,
+) {
+    let entities_with_subface: Vec<Entity> = cad_objects
+        .iter()
+        .filter_map(|(ent, _)| {
+            topologies
+                .get(ent)
+                .ok()
+                .and_then(|t| t.selected_subface_id.map(|_| ent))
+        })
+        .collect();
+
+    for ent in entities_with_subface {
+        let mut updated_mesh: Option<Mesh> = None;
+        let mut restored_label: Option<String> = None;
+        if let Ok(mut topo) = topologies.get_mut(ent) {
+            topo.selected_subface_id = None;
+            restored_label = Some(topo.formatted_selection_label("Block"));
+            if let Ok((_, obj)) = cad_objects.get(ent) {
+                if let CadGeometryKind::Block { center, size } = obj.geometry {
+                    updated_mesh =
+                        Some(build_manifold_block_mesh_with_topology(center, size, &topo));
+                }
+            }
+        }
+        if let Some(lbl) = restored_label {
+            if let Ok((_, mut obj)) = cad_objects.get_mut(ent) {
+                if !lbl.is_empty() {
+                    obj.label = lbl;
+                }
+            }
+        }
+        if let Some(m) = updated_mesh {
+            let new_h = meshes.add(m);
+            if let Ok(mut mh) = mesh_handles.get_mut(ent) {
+                *mh = new_h;
+            }
+        }
+    }
+}
+
 fn handle_select_and_delete_tool(
     active_tool: Res<ActiveToolState>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     window_query: Query<&Window, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<OrbitCamera>>,
-    cad_objects: Query<(Entity, &CadObject)>,
+    mut cad_objects: Query<(Entity, &mut CadObject)>,
+    mut topologies: Query<&mut EditableBlockTopology>,
+    mut mesh_handles: Query<&mut Handle<Mesh>>,
+    mut meshes: ResMut<Assets<Mesh>>,
     mut selected: ResMut<SelectedCadObjects>,
+    mut vcb: ResMut<VcbInput>,
     mut history: ResMut<CommandHistory>,
     mut egui_contexts: EguiContexts,
 ) {
+    // Keep SelectedCadObjects.isolated_subface synchronized if a command (such as CreateOffsetCommand)
+    // isolated a new sub-face on the primary selected entity.
+    if let Some(primary_ent) = selected.primary() {
+        if let Ok(topo) = topologies.get(primary_ent) {
+            if let Some(sub_id) = topo.selected_subface_id {
+                if let Some(subface) = topo.find_subface_by_id(sub_id) {
+                    selected.isolated_subface =
+                        Some((primary_ent, sub_id, subface.region_kind));
+                }
+            } else if selected
+                .isolated_subface
+                .map(|(e, _, _)| e == primary_ent)
+                .unwrap_or(false)
+            {
+                selected.isolated_subface = None;
+            }
+        }
+    }
+
     if !is_egui_consuming_keyboard(&mut egui_contexts)
         && (keys.just_pressed(KeyCode::Delete) || keys.just_pressed(KeyCode::Backspace))
     {
+        if let Some((ent, subface_id, region_kind)) = selected.isolated_subface.take() {
+            if let Ok((e, obj)) = cad_objects.get(ent) {
+                vcb.last_status =
+                    format!("Deleted {} #{}", region_kind.label(), subface_id);
+                history.execute_command(Box::new(DeleteCommand::for_isolated_subface(
+                    e,
+                    obj.clone(),
+                    subface_id,
+                )));
+                return;
+            }
+        }
+
         if !selected.entities.is_empty() {
             let mut to_delete = Vec::new();
             for ent in selected.entities.drain(..) {
@@ -1766,6 +1872,7 @@ fn handle_select_and_delete_tool(
                     to_delete.push((e, obj.clone()));
                 }
             }
+            selected.isolated_subface = None;
             if !to_delete.is_empty() {
                 history.execute_command(Box::new(DeleteCommand::new(to_delete)));
                 return;
@@ -1795,10 +1902,129 @@ fn handle_select_and_delete_tool(
             return;
         };
 
-        if let Some((hit_ent, _)) = raycast_closest_cad_object_point(ray, &cad_objects) {
-            selected.select_single(hit_ent);
-        } else {
-            selected.clear();
+        clear_all_subface_highlights(
+            &mut cad_objects,
+            &mut topologies,
+            &mut mesh_handles,
+            &mut meshes,
+        );
+
+        // Raycast all Block sub-faces and Line objects to find the exact targeted sub-face or entity
+        let mut best_block_hit: Option<(f32, Entity, usize, SubFaceRegionKind)> = None;
+        for (entity, obj) in cad_objects.iter() {
+            if let CadGeometryKind::Block { center, size } = obj.geometry {
+                let mut topo = topologies.get(entity).cloned().unwrap_or_default();
+                topo.ensure_initialized(center, size);
+                let has_subdivisions = topo.faces.len() > 6
+                    || topo
+                        .faces
+                        .iter()
+                        .any(|f| !f.inner_holes.is_empty() || f.region_kind != SubFaceRegionKind::WholeFace);
+
+                for face_poly in &topo.faces {
+                    if let Some((t, _hit_pt, ray_kind, _contour, _hole_contour)) =
+                        raycast_manifold_polygon_face(ray, face_poly, obj.group_id)
+                    {
+                        let effective_kind = if !has_subdivisions {
+                            SubFaceRegionKind::WholeFace
+                        } else if face_poly.region_kind != SubFaceRegionKind::WholeFace {
+                            face_poly.region_kind
+                        } else {
+                            ray_kind
+                        };
+
+                        let should_replace = match best_block_hit {
+                            None => true,
+                            Some((prev_t, _, _, prev_kind)) => {
+                                if (t - prev_t).abs() <= 0.006_f32 {
+                                    effective_kind == SubFaceRegionKind::InnerLoop
+                                        && prev_kind != SubFaceRegionKind::InnerLoop
+                                } else {
+                                    t < prev_t
+                                }
+                            }
+                        };
+
+                        if should_replace {
+                            best_block_hit = Some((
+                                t,
+                                entity,
+                                face_poly.subface_id,
+                                effective_kind,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut best_line_hit: Option<(f32, Entity)> = None;
+        for (entity, obj) in cad_objects.iter() {
+            if matches!(obj.geometry, CadGeometryKind::Line { .. }) {
+                if let Some(t) = ray_intersects_cad_object(ray, obj) {
+                    if best_line_hit.map(|(pt, _)| t < pt).unwrap_or(true) {
+                        best_line_hit = Some((t, entity));
+                    }
+                }
+            }
+        }
+
+        match (best_block_hit, best_line_hit) {
+            (Some((bt, b_ent, sub_id, region_kind)), Some((lt, l_ent))) if lt + 0.02_f32 < bt => {
+                let _ = (b_ent, sub_id, region_kind);
+                selected.select_single(l_ent);
+            }
+            (Some((_bt, b_ent, sub_id, region_kind)), _) => {
+                // Isolate the targeted sub-face when it is an Inner Sub-Face, Outer Frame Ring, or subdivided face
+                let is_subdivided = topologies
+                    .get(b_ent)
+                    .map(|t| {
+                        t.faces.len() > 6
+                            || t.faces
+                                .iter()
+                                .any(|f| !f.inner_holes.is_empty() || f.region_kind != SubFaceRegionKind::WholeFace)
+                    })
+                    .unwrap_or(false);
+
+                if is_subdivided {
+                    selected.select_subface(b_ent, sub_id, region_kind);
+                    let mut rebuilt_mesh: Option<Mesh> = None;
+                    let mut updated_label: Option<String> = None;
+
+                    if let Ok(mut topo) = topologies.get_mut(b_ent) {
+                        topo.selected_subface_id = Some(sub_id);
+                        if let Ok((_, obj)) = cad_objects.get(b_ent) {
+                            updated_label = Some(topo.formatted_selection_label(&obj.label));
+                            if let CadGeometryKind::Block { center, size } = obj.geometry {
+                                rebuilt_mesh = Some(build_manifold_block_mesh_with_topology(
+                                    center, size, &topo,
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(new_lbl) = updated_label {
+                        if let Ok((_, mut obj)) = cad_objects.get_mut(b_ent) {
+                            obj.label = new_lbl;
+                        }
+                    }
+                    if let Some(mesh_asset) = rebuilt_mesh {
+                        let new_h = meshes.add(mesh_asset);
+                        if let Ok(mut mh) = mesh_handles.get_mut(b_ent) {
+                            *mh = new_h;
+                        }
+                    }
+                    vcb.last_status = format!("{}: #{}", region_kind.label(), sub_id);
+                } else {
+                    selected.select_single(b_ent);
+                    vcb.last_status = "Selected: Whole Block".to_string();
+                }
+            }
+            (None, Some((_lt, l_ent))) => {
+                selected.select_single(l_ent);
+            }
+            (None, None) => {
+                selected.clear();
+            }
         }
     }
 }
@@ -3511,31 +3737,34 @@ fn raycast_manifold_polygon_face(
         return None;
     }
 
-    if let Some(last_hole) = face.inner_holes.last() {
+    let mut last_hole_contour: Option<OffsetContour> = None;
+    for hole in &face.inner_holes {
         let hole_contour =
-            OffsetContour::from_coplanar_loop_3d(last_hole, Some(normal), group_id)?;
+            OffsetContour::from_coplanar_loop_3d(hole, Some(normal), group_id)?;
         let uv_hole = hole_contour.project_world_to_uv(hit_pt);
         if is_point_inside_polygon_2d(uv_hole, &hole_contour.vertices_uv) {
             return None;
         }
-        let t = ray.origin.distance(hit_pt);
+        last_hole_contour = Some(hole_contour);
+    }
+
+    let t = ray.origin.distance(hit_pt);
+    if let Some(hole_c) = last_hole_contour {
         return Some((
             t,
             hit_pt,
             SubFaceRegionKind::OuterFrame,
             outer_contour,
-            Some(hole_contour),
+            Some(hole_c),
         ));
     }
 
-    let t = ray.origin.distance(hit_pt);
-    Some((
-        t,
-        hit_pt,
-        SubFaceRegionKind::InnerLoop,
-        outer_contour,
-        None,
-    ))
+    let resolved_kind = if face.region_kind != SubFaceRegionKind::WholeFace {
+        face.region_kind
+    } else {
+        SubFaceRegionKind::InnerLoop
+    };
+    Some((t, hit_pt, resolved_kind, outer_contour, None))
 }
 
 fn detect_hovered_extrudable_face(
@@ -3557,22 +3786,41 @@ fn detect_hovered_extrudable_face(
         if let CadGeometryKind::Block { center, size } = obj.geometry {
             let mut topo = topologies.get(entity).cloned().unwrap_or_default();
             topo.ensure_initialized(center, size);
+            let has_subdivisions = topo.faces.len() > 6
+                || topo
+                    .faces
+                    .iter()
+                    .any(|f| !f.inner_holes.is_empty() || f.region_kind != SubFaceRegionKind::WholeFace);
 
             for face_poly in &topo.faces {
                 if let Some((t, hit_pt, region_kind, contour, hole_contour)) =
                     raycast_manifold_polygon_face(ray, face_poly, obj.group_id)
                 {
-                    if t < best_block_t {
+                    let classified_kind = if !has_subdivisions && face_poly.inner_holes.is_empty() {
+                        SubFaceRegionKind::WholeFace
+                    } else if face_poly.region_kind != SubFaceRegionKind::WholeFace {
+                        face_poly.region_kind
+                    } else {
+                        region_kind
+                    };
+
+                    let replace = match &best_block_face {
+                        None => true,
+                        Some(prev) => {
+                            if (t - best_block_t).abs() <= 0.006_f32 {
+                                classified_kind == SubFaceRegionKind::InnerLoop
+                                    && prev.region_kind != SubFaceRegionKind::InnerLoop
+                            } else {
+                                t < best_block_t
+                            }
+                        }
+                    };
+
+                    if replace {
                         best_block_t = t;
-                        let classified_kind = if topo.faces.len() <= 6
-                            && face_poly.inner_holes.is_empty()
-                        {
-                            SubFaceRegionKind::WholeFace
-                        } else {
-                            region_kind
-                        };
                         best_block_face = Some(ExtrudableFace {
                             entity,
+                            subface_id: face_poly.subface_id,
                             is_block_face: true,
                             region_kind: classified_kind,
                             original_object: obj.clone(),
@@ -3611,6 +3859,7 @@ fn detect_hovered_extrudable_face(
                                 best_loop_t = t;
                                 best_loop_face = Some(ExtrudableFace {
                                     entity,
+                                    subface_id: 0,
                                     is_block_face: false,
                                     region_kind: SubFaceRegionKind::WholeFace,
                                     original_object: obj.clone(),
@@ -3772,7 +4021,11 @@ fn handle_push_pull_tool_interaction(
             {
                 push_pull_state.hovered_face = Some(face.clone());
                 if mouse_buttons.just_pressed(MouseButton::Left) {
-                    selected.select_single(face.entity);
+                    if face.is_block_face && face.region_kind != SubFaceRegionKind::WholeFace {
+                        selected.select_subface(face.entity, face.subface_id, face.region_kind);
+                    } else {
+                        selected.select_single(face.entity);
+                    }
                     push_pull_state.last_selected_face = Some(face.clone());
                     push_pull_state.active_face = Some(face);
                     push_pull_state.is_dragging = true;
@@ -3871,30 +4124,37 @@ fn handle_push_pull_tool_interaction(
                         group_opt,
                     )));
 
-                    let shift = face.contour.plane_normal.as_vec3() * dist;
-                    let shifted_verts: Vec<Vec3> = face
-                        .contour
-                        .vertices_3d()
-                        .into_iter()
-                        .map(|v| v + shift)
-                        .collect();
-                    if let Some(updated_contour) = OffsetContour::from_coplanar_loop_3d(
-                        &shifted_verts,
-                        Some(face.contour.plane_normal),
-                        group_opt,
-                    ) {
-                        let mut updated_obj = face.original_object.clone();
-                        updated_obj.geometry = after_geom;
-                        push_pull_state.last_selected_face = Some(ExtrudableFace {
-                            entity: face.entity,
-                            is_block_face: true,
-                            region_kind: face.region_kind,
-                            original_object: updated_obj,
-                            original_topology: after_topo,
-                            contour: updated_contour,
-                            inner_hole_contour: face.inner_hole_contour.clone(),
-                            drag_anchor_3d: face.drag_anchor_3d + shift,
-                        });
+                    if after_topo.find_subface_by_id(face.subface_id).is_none() {
+                        push_pull_state.last_selected_face = None;
+                        selected.isolated_subface = None;
+                        vcb.last_status = format!("Through-Hole Cut: {:+.2} m", dist);
+                    } else {
+                        let shift = face.contour.plane_normal.as_vec3() * dist;
+                        let shifted_verts: Vec<Vec3> = face
+                            .contour
+                            .vertices_3d()
+                            .into_iter()
+                            .map(|v| v + shift)
+                            .collect();
+                        if let Some(updated_contour) = OffsetContour::from_coplanar_loop_3d(
+                            &shifted_verts,
+                            Some(face.contour.plane_normal),
+                            group_opt,
+                        ) {
+                            let mut updated_obj = face.original_object.clone();
+                            updated_obj.geometry = after_geom;
+                            push_pull_state.last_selected_face = Some(ExtrudableFace {
+                                entity: face.entity,
+                                subface_id: face.subface_id,
+                                is_block_face: true,
+                                region_kind: face.region_kind,
+                                original_object: updated_obj,
+                                original_topology: after_topo,
+                                contour: updated_contour,
+                                inner_hole_contour: face.inner_hole_contour.clone(),
+                                drag_anchor_3d: face.drag_anchor_3d + shift,
+                            });
+                        }
                     }
                 } else {
                     let initial_boundary_loop = face.contour.vertices_3d();
@@ -4145,7 +4405,36 @@ fn process_vcb_commit_requests(
                         .active_face
                         .clone()
                         .or_else(|| push_pull_state.hovered_face.clone())
-                        .or_else(|| push_pull_state.last_selected_face.clone());
+                        .or_else(|| push_pull_state.last_selected_face.clone())
+                        .or_else(|| {
+                            let (ent, sub_id, _kind) = selected.isolated_subface?;
+                            let (_, obj) = cad_objects.get(ent).ok()?;
+                            let topo = topologies.get(ent).ok()?.clone();
+                            let face_poly = topo.find_subface_by_id(sub_id)?;
+                            let contour = OffsetContour::from_coplanar_loop_3d(
+                                &face_poly.outer_loop,
+                                Some(face_poly.normal),
+                                obj.group_id,
+                            )?;
+                            let hole_contour = face_poly.inner_holes.last().and_then(|h| {
+                                OffsetContour::from_coplanar_loop_3d(
+                                    h,
+                                    Some(face_poly.normal),
+                                    obj.group_id,
+                                )
+                            });
+                            Some(ExtrudableFace {
+                                entity: ent,
+                                subface_id: sub_id,
+                                is_block_face: true,
+                                region_kind: face_poly.region_kind,
+                                original_object: obj.clone(),
+                                original_topology: topo,
+                                drag_anchor_3d: contour.plane_origin,
+                                contour,
+                                inner_hole_contour: hole_contour,
+                            })
+                        });
 
                     if let Some(mut face) = target_face {
                         if was_dragging && face.is_block_face {
@@ -4192,30 +4481,35 @@ fn process_vcb_commit_requests(
                                 group_opt,
                             )));
 
-                            let shift = face.contour.plane_normal.as_vec3() * signed_dist;
-                            let shifted_verts: Vec<Vec3> = face
-                                .contour
-                                .vertices_3d()
-                                .into_iter()
-                                .map(|v| v + shift)
-                                .collect();
-                            if let Some(updated_contour) = OffsetContour::from_coplanar_loop_3d(
-                                &shifted_verts,
-                                Some(face.contour.plane_normal),
-                                group_opt,
-                            ) {
-                                let mut updated_obj = face.original_object.clone();
-                                updated_obj.geometry = after_geom;
-                                push_pull_state.last_selected_face = Some(ExtrudableFace {
-                                    entity: face.entity,
-                                    is_block_face: true,
-                                    region_kind: face.region_kind,
-                                    original_object: updated_obj,
-                                    original_topology: after_topo,
-                                    contour: updated_contour,
-                                    inner_hole_contour: face.inner_hole_contour.clone(),
-                                    drag_anchor_3d: face.drag_anchor_3d + shift,
-                                });
+                            if after_topo.find_subface_by_id(face.subface_id).is_none() {
+                                push_pull_state.last_selected_face = None;
+                            } else {
+                                let shift = face.contour.plane_normal.as_vec3() * signed_dist;
+                                let shifted_verts: Vec<Vec3> = face
+                                    .contour
+                                    .vertices_3d()
+                                    .into_iter()
+                                    .map(|v| v + shift)
+                                    .collect();
+                                if let Some(updated_contour) = OffsetContour::from_coplanar_loop_3d(
+                                    &shifted_verts,
+                                    Some(face.contour.plane_normal),
+                                    group_opt,
+                                ) {
+                                    let mut updated_obj = face.original_object.clone();
+                                    updated_obj.geometry = after_geom;
+                                    push_pull_state.last_selected_face = Some(ExtrudableFace {
+                                        entity: face.entity,
+                                        subface_id: face.subface_id,
+                                        is_block_face: true,
+                                        region_kind: face.region_kind,
+                                        original_object: updated_obj,
+                                        original_topology: after_topo,
+                                        contour: updated_contour,
+                                        inner_hole_contour: face.inner_hole_contour.clone(),
+                                        drag_anchor_3d: face.drag_anchor_3d + shift,
+                                    });
+                                }
                             }
                         } else {
                             let base_verts = face.contour.vertices_3d();
@@ -4325,31 +4619,42 @@ fn refresh_selection_materials(
     active_tool: Res<ActiveToolState>,
     selected: Res<SelectedCadObjects>,
     push_pull_state: Res<PushPullToolState>,
-    cad_query: Query<(Entity, &CadObject, &Handle<StandardMaterial>)>,
+    cad_query: Query<(
+        Entity,
+        &CadObject,
+        &Handle<StandardMaterial>,
+        Option<&EditableBlockTopology>,
+    )>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let hovered_push_pull_ent = if active_tool.current == CadTool::PushPullExtrude {
-        push_pull_state
-            .active_face
-            .as_ref()
-            .or(push_pull_state.hovered_face.as_ref())
-            .map(|f| f.entity)
-    } else {
-        None
-    };
+    let _ = (&active_tool, &push_pull_state);
 
-    for (entity, obj, mat_handle) in cad_query.iter() {
-        if let Some(mat) = materials.get_mut(mat_handle) {
-            if Some(entity) == hovered_push_pull_ent {
-                mat.base_color = obj.material_color.0;
-                mat.emissive = LinearRgba::new(0.08_f32, 0.55_f32, 0.48_f32, 1.0_f32);
-            } else if selected.contains(entity) {
+    for (entity, obj, mat_handle, maybe_topo) in cad_query.iter() {
+        let Some(mat) = materials.get_mut(mat_handle) else {
+            continue;
+        };
+
+        if let Some(topo) = maybe_topo {
+            // Block meshes carry per-sub-face vertex colors (Mesh::ATTRIBUTE_COLOR).
+            // When a specific sub-face (e.g. Inner Sub-Face or Outer Frame Ring) is isolated,
+            // keep mat.base_color = Color::WHITE so ONLY the isolated sub-face triangles glow
+            // in NEON_BLUE_SELECTION_COLOR while the rest of the block stays its normal color!
+            let has_isolated_subface = topo.selected_subface_id.is_some()
+                || selected.isolated_subface_for(entity).is_some();
+
+            if selected.contains(entity) && !has_isolated_subface {
                 mat.base_color = NEON_BLUE_SELECTION_COLOR;
                 mat.emissive = LinearRgba::new(0.05_f32, 0.45_f32, 0.65_f32, 1.0_f32);
             } else {
-                mat.base_color = obj.material_color.0;
+                mat.base_color = Color::WHITE;
                 mat.emissive = LinearRgba::BLACK;
             }
+        } else if selected.contains(entity) {
+            mat.base_color = NEON_BLUE_SELECTION_COLOR;
+            mat.emissive = LinearRgba::new(0.05_f32, 0.45_f32, 0.65_f32, 1.0_f32);
+        } else {
+            mat.base_color = obj.material_color.0;
+            mat.emissive = LinearRgba::BLACK;
         }
     }
 }
@@ -4472,7 +4777,7 @@ fn render_active_tool_gizmos(
     }
 
     let seam_edge_color = Color::srgb(0.18, 0.22, 0.28);
-    for (_obj, maybe_topo) in cad_objects.iter() {
+    for (obj, maybe_topo) in cad_objects.iter() {
         if let Some(topo) = maybe_topo {
             for face_poly in &topo.faces {
                 for k in 0..4 {
@@ -4487,6 +4792,58 @@ fn render_active_tool_gizmos(
                     for k in 0..4 {
                         let next_k = (k + 1) % 4;
                         gizmos.line(hole[k], hole[next_k], seam_edge_color);
+                    }
+                }
+            }
+
+            if let Some(sel_sub_id) = topo.selected_subface_id {
+                if let Some(sel_face) = topo.find_subface_by_id(sel_sub_id) {
+                    let n_lift = sel_face.normal.as_vec3() * 0.005_f32;
+                    for k in 0..4 {
+                        let next_k = (k + 1) % 4;
+                        let a = sel_face.outer_loop[k] + n_lift;
+                        let b = sel_face.outer_loop[next_k] + n_lift;
+                        gizmos.line(a, b, NEON_BLUE_SELECTION_COLOR);
+                        gizmos.sphere(a, Quat::IDENTITY, 0.055_f32, NEON_BLUE_SELECTION_COLOR);
+                    }
+                    for hole in &sel_face.inner_holes {
+                        for k in 0..4 {
+                            let next_k = (k + 1) % 4;
+                            let a = hole[k] + n_lift;
+                            let b = hole[next_k] + n_lift;
+                            gizmos.line(a, b, NEON_BLUE_SELECTION_COLOR);
+                        }
+                    }
+                    if let Some(sel_contour) = OffsetContour::from_coplanar_loop_3d(
+                        &sel_face.outer_loop,
+                        Some(sel_face.normal),
+                        obj.group_id,
+                    ) {
+                        if let Some(last_hole) = sel_face.inner_holes.last() {
+                            if let Some(hole_contour) = OffsetContour::from_coplanar_loop_3d(
+                                last_hole,
+                                Some(sel_face.normal),
+                                obj.group_id,
+                            ) {
+                                for dot_pt in sel_contour.sample_annular_dots_3d(&hole_contour) {
+                                    gizmos.sphere(
+                                        dot_pt,
+                                        Quat::IDENTITY,
+                                        0.028_f32,
+                                        NEON_BLUE_SELECTION_COLOR,
+                                    );
+                                }
+                            }
+                        } else {
+                            for dot_pt in sel_contour.sample_interior_dots_3d() {
+                                gizmos.sphere(
+                                    dot_pt,
+                                    Quat::IDENTITY,
+                                    0.028_f32,
+                                    NEON_BLUE_SELECTION_COLOR,
+                                );
+                            }
+                        }
                     }
                 }
             }
