@@ -1017,7 +1017,7 @@ impl ExtrudableFace {
             return Vec::new();
         }
         let shift = self.contour.plane_normal.as_vec3() * distance;
-        let mut segments = Vec::with_capacity(count * 3);
+        let mut segments = Vec::with_capacity(count * 6);
         for i in 0..count {
             let b0 = base_verts[i];
             let b1 = base_verts[(i + 1) % count];
@@ -1025,6 +1025,18 @@ impl ExtrudableFace {
             let t1 = b1 + shift;
             segments.push((b0, t0));
             segments.push((t0, t1));
+        }
+        if let Some(ref hole_contour) = self.inner_hole_contour {
+            let hole_verts = hole_contour.vertices_3d();
+            let h_count = hole_verts.len();
+            for i in 0..h_count {
+                let b0 = hole_verts[i];
+                let b1 = hole_verts[(i + 1) % h_count];
+                let t0 = b0 + shift;
+                let t1 = b1 + shift;
+                segments.push((b0, t0));
+                segments.push((t0, t1));
+            }
         }
         segments
     }

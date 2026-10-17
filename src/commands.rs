@@ -379,6 +379,16 @@ impl EditableBlockTopology {
         self.faces.iter().find(|f| f.subface_id == subface_id)
     }
 
+    /// True CAD Solid Manifold Hole-Cutting with Tunnel Stitching:
+    /// When an `Inner Sub-Face` is deleted, do NOT merely drop its front triangles.
+    /// Instead:
+    /// 1. Project the deleted sub-face loop vertices along its reverse normal vector (`-n_vec`)
+    ///    straight through the depth of the parent block until they intersect the opposing back plane.
+    /// 2. Slice and remove the matching aperture area on the BACK face of the block so the window
+    ///    opening is cleanly open on both ends.
+    /// 3. Dynamically generate 4 internal perpendicular side-walls (interior window reveals / tunnel sleeve)
+    ///    with Counter-Clockwise (CCW) vertex winding orders and normals pointing INWARD toward the center
+    ///    of the tunnel so the camera sees solid interior walls instead of empty space.
     pub fn delete_subface_by_id(&mut self, subface_id: usize) -> bool {
         let Some(pos) = self.faces.iter().position(|f| f.subface_id == subface_id) else {
             return false;
@@ -386,7 +396,196 @@ impl EditableBlockTopology {
         if self.faces.len() <= 1 {
             return false;
         }
-        self.faces.remove(pos);
+
+        let target_face = self.faces[pos].clone();
+        let face_normal = target_face.normal;
+        let n_vec = face_normal.as_vec3();
+        let front_loop_ccw = orient_loop_ccw(&target_face.outer_loop, n_vec);
+
+        // Determine if this sub-face is an Inner Sub-Face or a hole inside a coplanar frame
+        let mut is_hole_of_coplanar_frame = false;
+        for (other_idx, other_face) in self.faces.iter_mut().enumerate() {
+            if other_idx == pos {
+                continue;
+            }
+            if other_face.normal.as_vec3().dot(n_vec) > 0.98_f32 {
+                for hole in &other_face.inner_holes {
+                    let aligned_h = align_inner_loop_to_outer(&front_loop_ccw, hole, n_vec);
+                    let err: f32 = (0..4).map(|k| front_loop_ccw[k].distance(aligned_h[k])).sum();
+                    if err < 0.15_f32 {
+                        is_hole_of_coplanar_frame = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let is_inner_aperture = target_face.region_kind == SubFaceRegionKind::InnerLoop
+            || is_hole_of_coplanar_frame;
+
+        if is_inner_aperture && target_face.inner_holes.is_empty() {
+            // Ensure the coplanar front frame face registers front_loop_ccw as an inner hole
+            for (other_idx, other_face) in self.faces.iter_mut().enumerate() {
+                if other_idx == pos {
+                    continue;
+                }
+                if other_face.normal.as_vec3().dot(n_vec) > 0.98_f32 {
+                    let plane_dist = (other_face.plane_origin() - target_face.plane_origin())
+                        .dot(n_vec)
+                        .abs();
+                    if plane_dist <= 0.04_f32 {
+                        let outer_ccw = orient_loop_ccw(&other_face.outer_loop, n_vec);
+                        let (u_ax, v_ax) = build_plane_uv_axes(n_vec);
+                        let outer_uv = project_loop_2d_with_basis(
+                            &outer_ccw,
+                            other_face.plane_origin(),
+                            u_ax,
+                            v_ax,
+                        );
+                        let c_pt = target_face.plane_origin();
+                        let c_uv = Vec2::new(
+                            (c_pt - other_face.plane_origin()).dot(u_ax),
+                            (c_pt - other_face.plane_origin()).dot(v_ax),
+                        );
+                        if point_in_quad_2d(c_uv, &outer_uv) {
+                            let aligned_hole =
+                                align_inner_loop_to_outer(&outer_ccw, &front_loop_ccw, n_vec);
+                            let already_has_hole = other_face.inner_holes.iter().any(|h| {
+                                let ah = align_inner_loop_to_outer(&outer_ccw, h, n_vec);
+                                (0..4).map(|k| aligned_hole[k].distance(ah[k])).sum::<f32>()
+                                    < 0.15_f32
+                            });
+                            if !already_has_hole {
+                                other_face.inner_holes.push(aligned_hole);
+                                other_face.region_kind = SubFaceRegionKind::OuterFrame;
+                            }
+                            is_hole_of_coplanar_frame = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some((back_idx, thickness)) =
+                self.find_opposing_back_face(pos, &front_loop_ccw, n_vec)
+            {
+                let back_origin = self.faces[back_idx].plane_origin();
+                let back_n = self.faces[back_idx].normal.as_vec3();
+                let cut_shift = -n_vec * thickness;
+
+                let mut back_opening = [Vec3::ZERO; 4];
+                for k in 0..4 {
+                    let raw_pt = front_loop_ccw[k] + cut_shift;
+                    let residual = (raw_pt - back_origin).dot(back_n);
+                    back_opening[k] = raw_pt - back_n * residual;
+                }
+
+                // 1. Slice and remove the matching duplicate area on the BACK face of the block
+                let back_outer_ccw = orient_loop_ccw(&self.faces[back_idx].outer_loop, back_n);
+                let back_hole_ccw =
+                    align_inner_loop_to_outer(&back_outer_ccw, &back_opening, back_n);
+
+                let already_present_on_back =
+                    self.faces[back_idx].inner_holes.iter().any(|existing| {
+                        let aligned_ex =
+                            align_inner_loop_to_outer(&back_outer_ccw, existing, back_n);
+                        (0..4)
+                            .map(|k| back_hole_ccw[k].distance(aligned_ex[k]))
+                            .sum::<f32>()
+                            < 0.15_f32
+                    });
+
+                if !already_present_on_back {
+                    self.faces[back_idx].inner_holes.push(back_hole_ccw);
+                    self.faces[back_idx].region_kind = SubFaceRegionKind::OuterFrame;
+                }
+
+                // Also check if there is a separate coplanar InnerLoop sub-face on the back plane
+                // covering that same opening, and remove it so both ends of the tunnel are open
+                let back_centroid = (back_opening[0]
+                    + back_opening[1]
+                    + back_opening[2]
+                    + back_opening[3])
+                    * 0.25_f32;
+                let mut duplicate_back_subface_id: Option<usize> = None;
+                for (cand_i, cand_f) in self.faces.iter().enumerate() {
+                    if cand_i == pos || cand_i == back_idx {
+                        continue;
+                    }
+                    if cand_f.normal.as_vec3().dot(back_n) > 0.98_f32
+                        && cand_f.inner_holes.is_empty()
+                    {
+                        let aligned_c =
+                            align_inner_loop_to_outer(&back_hole_ccw, &cand_f.outer_loop, back_n);
+                        let err: f32 = (0..4)
+                            .map(|k| back_hole_ccw[k].distance(aligned_c[k]))
+                            .sum();
+                        if err < 0.20_f32
+                            || cand_f.plane_origin().distance(back_centroid) < 0.10_f32
+                        {
+                            duplicate_back_subface_id = Some(cand_f.subface_id);
+                            break;
+                        }
+                    }
+                }
+
+                // 2. Dynamically generate 4 internal perpendicular side-walls (window reveals / tunnel sleeve)
+                // connecting the front perimeter cut edges directly to the back perimeter cut edges with CCW
+                // normals pointing INWARD toward the center of the tunnel.
+                if is_hole_of_coplanar_frame {
+                    for k in 0..4 {
+                        let next_k = (k + 1) % 4;
+                        let b0 = front_loop_ccw[k];
+                        let b1 = front_loop_ccw[next_k];
+                        let t1 = back_opening[next_k];
+                        let t0 = back_opening[k];
+
+                        let edge_dir = (b1 - b0).normalize_or_zero();
+                        let outward_ring_normal = edge_dir.cross(n_vec).normalize_or_zero();
+                        // Point INWARD toward the center of the tunnel so the camera sees solid walls
+                        let tunnel_inward_normal = -outward_ring_normal;
+
+                        if let Ok(wall_dir) = Dir3::new(tunnel_inward_normal) {
+                            let wall_loop =
+                                orient_loop_ccw(&[b0, b1, t1, t0], tunnel_inward_normal);
+                            let wall_id = self.allocate_subface_id();
+                            self.faces.push(ManifoldPolygonFace {
+                                subface_id: wall_id,
+                                region_kind: SubFaceRegionKind::WholeFace,
+                                normal: wall_dir,
+                                outer_loop: wall_loop,
+                                inner_holes: Vec::new(),
+                            });
+                        }
+                    }
+                } else {
+                    // If the Inner Sub-Face was already partially recessed into a pocket before deletion,
+                    // extend its existing 4 pocket walls all the way to the back-face opening
+                    for (other_idx, other_face) in self.faces.iter_mut().enumerate() {
+                        if other_idx == pos || other_idx == back_idx {
+                            continue;
+                        }
+                        if other_face.normal.as_vec3().dot(n_vec).abs() < 0.95_f32 {
+                            for v in &mut other_face.outer_loop {
+                                for k in 0..4 {
+                                    if v.distance(front_loop_ccw[k]) < 0.035_f32 {
+                                        *v = back_opening[k];
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(dup_id) = duplicate_back_subface_id {
+                    self.faces.retain(|f| f.subface_id != dup_id);
+                }
+            }
+        }
+
+        // Remove the deleted target sub-face itself
+        self.faces.retain(|f| f.subface_id != subface_id);
         if self.selected_subface_id == Some(subface_id) {
             self.selected_subface_id = None;
         }
@@ -501,7 +700,8 @@ impl EditableBlockTopology {
         let front_centroid =
             (front_loop_ccw[0] + front_loop_ccw[1] + front_loop_ccw[2] + front_loop_ccw[3])
                 * 0.25_f32;
-        let mut best_back: Option<(usize, f32)> = None;
+        let mut best_containing: Option<(usize, f32)> = None;
+        let mut best_fallback: Option<(usize, f32)> = None;
 
         for (idx, candidate) in self.faces.iter().enumerate() {
             if idx == face_idx {
@@ -517,6 +717,13 @@ impl EditableBlockTopology {
                 continue;
             }
 
+            match best_fallback {
+                Some((_, prev_t)) if thickness >= prev_t => {}
+                _ => {
+                    best_fallback = Some((idx, thickness));
+                }
+            }
+
             let projected_center = front_centroid - n_vec * thickness;
             let (u_axis, v_axis) = build_plane_uv_axes(cand_n);
             let quad_uv =
@@ -525,19 +732,17 @@ impl EditableBlockTopology {
                 (projected_center - cand_origin).dot(u_axis),
                 (projected_center - cand_origin).dot(v_axis),
             );
-            if !point_in_quad_2d(pt_uv, &quad_uv) {
-                continue;
-            }
-
-            match best_back {
-                Some((_, prev_t)) if thickness >= prev_t => {}
-                _ => {
-                    best_back = Some((idx, thickness));
+            if point_in_quad_2d(pt_uv, &quad_uv) {
+                match best_containing {
+                    Some((_, prev_t)) if thickness >= prev_t => {}
+                    _ => {
+                        best_containing = Some((idx, thickness));
+                    }
                 }
             }
         }
 
-        best_back
+        best_containing.or(best_fallback)
     }
 
     pub fn apply_offset_split(
@@ -592,6 +797,20 @@ impl EditableBlockTopology {
                 outer_loop: offset_ccw,
                 inner_holes: vec![base_ccw],
             });
+            // Also add a back-facing annular cap for the overhanging outward-offset ring so orbiting
+            // behind the flange never shows a transparent backface-culled surface
+            if let Ok(back_dir) = Dir3::new(-n_vec) {
+                let back_outer = orient_loop_ccw(&offset_ccw, -n_vec);
+                let back_hole = align_inner_loop_to_outer(&back_outer, &base_ccw, -n_vec);
+                let back_cap_id = self.allocate_subface_id();
+                self.faces.push(ManifoldPolygonFace {
+                    subface_id: back_cap_id,
+                    region_kind: SubFaceRegionKind::OuterFrame,
+                    normal: back_dir,
+                    outer_loop: back_outer,
+                    inner_holes: vec![back_hole],
+                });
+            }
             self.selected_subface_id = Some(outer_id);
             outer_id
         }
@@ -615,6 +834,7 @@ impl EditableBlockTopology {
         };
 
         let target_subface_id = self.faces[face_idx].subface_id;
+        // Cache both the external perimeter edge loop and internal boundary edge loops before transformation
         let old_outer = orient_loop_ccw(&self.faces[face_idx].outer_loop, n_vec);
         let old_holes = self.faces[face_idx].inner_holes.clone();
         let effective_kind = if region_kind != SubFaceRegionKind::WholeFace {
@@ -644,8 +864,8 @@ impl EditableBlockTopology {
         let opposing_back = self.find_opposing_back_face(face_idx, &old_outer, n_vec);
 
         // 2. BOOLEAN THROUGH-HOLE CUTTING:
-        // If an Inner Sub-Face (either flush with a frame or already partially recessed) is pushed
-        // backwards (distance < 0.0) and its depth reaches or exceeds the thickness to the opposing back face:
+        // If an Inner Sub-Face is pushed backwards (distance < 0.0) and its depth reaches or exceeds
+        // the thickness to the opposing back face:
         let is_inner_subface =
             effective_kind == SubFaceRegionKind::InnerLoop || is_hole_of_coplanar_frame;
         if is_inner_subface && old_holes.is_empty() && distance < 0.0_f32 {
@@ -663,7 +883,6 @@ impl EditableBlockTopology {
                         back_opening[k] = raw_pt - back_n * residual;
                     }
 
-                    // Cut the matching hole in the opposing BACK face of the block
                     let back_outer_ccw =
                         orient_loop_ccw(&self.faces[back_idx].outer_loop, back_n);
                     let back_hole_ccw =
@@ -687,7 +906,6 @@ impl EditableBlockTopology {
                     }
 
                     if is_hole_of_coplanar_frame {
-                        // Stitch 4 Counter-Clockwise interior tunnel side-walls connecting front opening to back opening
                         for k in 0..4 {
                             let next_k = (k + 1) % 4;
                             let b0 = old_outer[k];
@@ -713,7 +931,6 @@ impl EditableBlockTopology {
                             }
                         }
                     } else {
-                        // Slide existing pocket side-wall vertices to stitch flush onto the back-face opening
                         for (other_idx, other_face) in self.faces.iter_mut().enumerate() {
                             if other_idx == face_idx || other_idx == back_idx {
                                 continue;
@@ -731,7 +948,6 @@ impl EditableBlockTopology {
                         }
                     }
 
-                    // Delete the overlapping pushed cap face so the tunnel is completely open at both ends
                     self.faces.remove(face_idx);
                     if self.selected_subface_id == Some(target_subface_id) {
                         self.selected_subface_id = None;
@@ -741,7 +957,6 @@ impl EditableBlockTopology {
             }
         }
 
-        // Clamp inward push distance for WholeFace or OuterFrame so the block never inverts through its back wall
         let clamped_distance = if distance < 0.0_f32 {
             if let Some((_back_idx, thickness)) = opposing_back {
                 let min_remaining = if is_inner_subface { 0.02_f32 } else { 0.10_f32 };
@@ -758,9 +973,8 @@ impl EditableBlockTopology {
         }
         let shift = n_vec * clamped_distance;
 
-        // 3. If this face is NOT a flush hole inside a coplanar frame and has NO inner holes
-        // (i.e. either a main WholeFace of the block or an already-extruded/recessed InnerLoop cap),
-        // slide its outer_loop AND the shared vertices on its attached perpendicular side walls!
+        // 3. Pure un-holed WholeFace (or already-extruded InnerLoop cap not coplanar with a frame):
+        // Slide its outer_loop and any shared corner vertices on perpendicular walls.
         if !is_hole_of_coplanar_frame && old_holes.is_empty() {
             for v in &mut self.faces[face_idx].outer_loop {
                 *v += shift;
@@ -780,18 +994,41 @@ impl EditableBlockTopology {
             return;
         }
 
-        // 4. If this is an OuterFrame face (!old_holes.is_empty()) and its outer_loop is the block's
-        // exterior perimeter (!is_hole_of_coplanar_frame), slide the shared vertices on the block's
-        // perpendicular exterior walls instead of leaving hollow fins behind!
-        if !is_hole_of_coplanar_frame && !old_holes.is_empty() {
-            for v in &mut self.faces[face_idx].outer_loop {
-                *v += shift;
+        // 4. SOLID MANIFOLD DUAL-LOOP STITCHING FOR SUB-FACE / OUTER FRAME RING PUSH/PULL:
+        // When a subdivided face structure (such as an Outer Frame Ring with both external perimeter
+        // `old_outer` and internal hole loops `old_holes`, or a flush Inner Sub-Face) is extruded:
+        // Translate the active face vertices by `shift` and dynamically stitch solid CCW quad-polygons
+        // along EVERY edge segment of both `old_outer` and `old_holes`!
+        let mut shared_block_corners_count = 0_usize;
+        for (other_idx, other_face) in self.faces.iter().enumerate() {
+            if other_idx == face_idx {
+                continue;
             }
-            for hole in &mut self.faces[face_idx].inner_holes {
-                for v in hole {
-                    *v += shift;
+            if other_face.normal.as_vec3().dot(n_vec).abs() < 0.95_f32 {
+                for v in &other_face.outer_loop {
+                    if old_outer.iter().any(|orig| orig.distance(*v) < 0.025_f32) {
+                        shared_block_corners_count += 1;
+                    }
                 }
             }
+        }
+        let outer_matches_block_wall =
+            !is_hole_of_coplanar_frame && !old_holes.is_empty() && shared_block_corners_count >= 4;
+
+        // Move the active sub-face's outer loop and inner holes to the new displaced plane
+        for v in &mut self.faces[face_idx].outer_loop {
+            *v += shift;
+        }
+        for hole in &mut self.faces[face_idx].inner_holes {
+            for v in hole {
+                *v += shift;
+            }
+        }
+
+        // 4A. Stitch the 4 external perimeter side-walls (old_outer -> old_outer + shift)
+        if outer_matches_block_wall && clamped_distance < 0.0_f32 {
+            // When pushing a flush Outer Frame Ring inward into the block, slide the shared exterior
+            // corners of the 4 perpendicular block walls back so no hollow fins remain
             for (other_idx, other_face) in self.faces.iter_mut().enumerate() {
                 if other_idx == face_idx {
                     continue;
@@ -804,10 +1041,118 @@ impl EditableBlockTopology {
                     }
                 }
             }
+        } else {
+            // Dynamically generate 4 solid CCW quad-polygons (8 triangles) stitching the external perimeter loop
+            for k in 0..4 {
+                let next_k = (k + 1) % 4;
+                let b0 = old_outer[k];
+                let b1 = old_outer[next_k];
+                let t1 = b1 + shift;
+                let t0 = b0 + shift;
 
-            // Stitch 4 inner step side-wall faces along each hole -> hole + shift
-            for hole in old_holes {
-                let hole_ccw = orient_loop_ccw(&hole, n_vec);
+                let edge_dir = (b1 - b0).normalize_or_zero();
+                let outward_ring_normal = edge_dir.cross(n_vec).normalize_or_zero();
+                // For an Outer Frame Ring (!old_holes.is_empty()), its external perimeter always faces
+                // radially OUTWARD (+outward_ring_normal). For a recessed InnerLoop pocket (distance < 0),
+                // the pocket walls face INWARD (-outward_ring_normal).
+                let wall_normal_vec = if !old_holes.is_empty() || clamped_distance >= 0.0_f32 {
+                    outward_ring_normal
+                } else {
+                    -outward_ring_normal
+                };
+
+                if let Ok(wall_dir) = Dir3::new(wall_normal_vec) {
+                    let wall_loop = orient_loop_ccw(&[b0, b1, t1, t0], wall_normal_vec);
+                    let wall_id = self.allocate_subface_id();
+                    self.faces.push(ManifoldPolygonFace {
+                        subface_id: wall_id,
+                        region_kind: SubFaceRegionKind::WholeFace,
+                        normal: wall_dir,
+                        outer_loop: wall_loop,
+                        inner_holes: Vec::new(),
+                    });
+                }
+            }
+
+            // If this is an overhanging outward-offset OuterFrame without a back cap yet, seal its base plane
+            if !old_holes.is_empty() && shared_block_corners_count == 0 {
+                if let Ok(back_dir) = Dir3::new(-n_vec) {
+                    let back_outer = orient_loop_ccw(&old_outer, -n_vec);
+                    let has_back_cap = self.faces.iter().any(|f| {
+                        f.normal.as_vec3().dot(-n_vec) > 0.98_f32
+                            && (f.plane_origin() - self.faces[face_idx].plane_origin() + shift)
+                                .dot(n_vec)
+                                .abs()
+                                < 0.03_f32
+                    });
+                    if !has_back_cap {
+                        let back_holes: Vec<[Vec3; 4]> = old_holes
+                            .iter()
+                            .map(|h| align_inner_loop_to_outer(&back_outer, h, -n_vec))
+                            .collect();
+                        let cap_id = self.allocate_subface_id();
+                        self.faces.push(ManifoldPolygonFace {
+                            subface_id: cap_id,
+                            region_kind: SubFaceRegionKind::OuterFrame,
+                            normal: back_dir,
+                            outer_loop: back_outer,
+                            inner_holes: back_holes,
+                        });
+                    }
+                }
+            }
+        }
+
+        // 4B. Stitch the 4 internal boundary side-walls for every inner hole loop (hole -> hole + shift)
+        for hole in old_holes {
+            let hole_ccw = orient_loop_ccw(&hole, n_vec);
+
+            // Check if a coplanar Inner Sub-Face still sits at hole_ccw
+            let has_coplanar_inner_cap = self.faces.iter().enumerate().any(|(idx, f)| {
+                if idx == face_idx || !f.inner_holes.is_empty() {
+                    return false;
+                }
+                if f.normal.as_vec3().dot(n_vec) < 0.98_f32 {
+                    return false;
+                }
+                let aligned = align_inner_loop_to_outer(&hole_ccw, &f.outer_loop, n_vec);
+                (0..4).map(|k| hole_ccw[k].distance(aligned[k])).sum::<f32>() < 0.15_f32
+            });
+
+            // Check if existing window-tunnel reveal walls are already attached to hole_ccw
+            // (for example, when the Inner Sub-Face was already deleted to form a through-tunnel)
+            let mut attached_tunnel_wall_verts = 0_usize;
+            if !has_coplanar_inner_cap {
+                for (other_idx, other_face) in self.faces.iter().enumerate() {
+                    if other_idx == face_idx {
+                        continue;
+                    }
+                    if other_face.normal.as_vec3().dot(n_vec).abs() < 0.95_f32 {
+                        for v in &other_face.outer_loop {
+                            if hole_ccw.iter().any(|hv| hv.distance(*v) < 0.025_f32) {
+                                attached_tunnel_wall_verts += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !has_coplanar_inner_cap && attached_tunnel_wall_verts >= 4 {
+                // Extend/retract the existing window tunnel reveal walls directly to hole_ccw + shift
+                for (other_idx, other_face) in self.faces.iter_mut().enumerate() {
+                    if other_idx == face_idx {
+                        continue;
+                    }
+                    if other_face.normal.as_vec3().dot(n_vec).abs() < 0.95_f32 {
+                        for v in &mut other_face.outer_loop {
+                            if hole_ccw.iter().any(|hv| hv.distance(*v) < 0.025_f32) {
+                                *v += shift;
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Dynamically generate 4 solid CCW quad-polygons (8 triangles) stitching the internal hole loop
                 for k in 0..4 {
                     let next_k = (k + 1) % 4;
                     let b0 = hole_ccw[k];
@@ -817,7 +1162,11 @@ impl EditableBlockTopology {
 
                     let edge_dir = (b1 - b0).normalize_or_zero();
                     let outward_ring_normal = edge_dir.cross(n_vec).normalize_or_zero();
-                    let wall_normal_vec = if clamped_distance >= 0.0_f32 {
+                    // When pulling an Outer Frame Ring forward (clamped_distance >= 0.0) or when the inner
+                    // hole is open, the inner walls face INWARD (-outward_ring_normal) toward the tunnel center.
+                    // When pushing an Outer Frame Ring backward around a solid inner cap, they face OUTWARD.
+                    let wall_normal_vec = if clamped_distance >= 0.0_f32 || !has_coplanar_inner_cap
+                    {
                         -outward_ring_normal
                     } else {
                         outward_ring_normal
@@ -834,77 +1183,6 @@ impl EditableBlockTopology {
                             inner_holes: Vec::new(),
                         });
                     }
-                }
-            }
-            return;
-        }
-
-        // 5. Flush sub-face inside a coplanar frame (is_hole_of_coplanar_frame == true):
-        // Move the target sub-face's outer loop and inner holes by +shift and stitch 4 side walls
-        for v in &mut self.faces[face_idx].outer_loop {
-            *v += shift;
-        }
-        for hole in &mut self.faces[face_idx].inner_holes {
-            for v in hole {
-                *v += shift;
-            }
-        }
-
-        for k in 0..4 {
-            let next_k = (k + 1) % 4;
-            let b0 = old_outer[k];
-            let b1 = old_outer[next_k];
-            let t1 = b1 + shift;
-            let t0 = b0 + shift;
-
-            let edge_dir = (b1 - b0).normalize_or_zero();
-            let outward_ring_normal = edge_dir.cross(n_vec).normalize_or_zero();
-            let wall_normal_vec = if clamped_distance >= 0.0_f32 {
-                outward_ring_normal
-            } else {
-                -outward_ring_normal
-            };
-
-            if let Ok(wall_dir) = Dir3::new(wall_normal_vec) {
-                let wall_loop = orient_loop_ccw(&[b0, b1, t1, t0], wall_normal_vec);
-                let wall_id = self.allocate_subface_id();
-                self.faces.push(ManifoldPolygonFace {
-                    subface_id: wall_id,
-                    region_kind: SubFaceRegionKind::WholeFace,
-                    normal: wall_dir,
-                    outer_loop: wall_loop,
-                    inner_holes: Vec::new(),
-                });
-            }
-        }
-
-        for hole in old_holes {
-            let hole_ccw = orient_loop_ccw(&hole, n_vec);
-            for k in 0..4 {
-                let next_k = (k + 1) % 4;
-                let b0 = hole_ccw[k];
-                let b1 = hole_ccw[next_k];
-                let t1 = b1 + shift;
-                let t0 = b0 + shift;
-
-                let edge_dir = (b1 - b0).normalize_or_zero();
-                let outward_ring_normal = edge_dir.cross(n_vec).normalize_or_zero();
-                let wall_normal_vec = if clamped_distance >= 0.0_f32 {
-                    -outward_ring_normal
-                } else {
-                    outward_ring_normal
-                };
-
-                if let Ok(wall_dir) = Dir3::new(wall_normal_vec) {
-                    let wall_loop = orient_loop_ccw(&[b0, b1, t1, t0], wall_normal_vec);
-                    let wall_id = self.allocate_subface_id();
-                    self.faces.push(ManifoldPolygonFace {
-                        subface_id: wall_id,
-                        region_kind: SubFaceRegionKind::WholeFace,
-                        normal: wall_dir,
-                        outer_loop: wall_loop,
-                        inner_holes: Vec::new(),
-                    });
                 }
             }
         }
